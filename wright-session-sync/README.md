@@ -108,10 +108,10 @@ cp .env.example .env   # then fill in TEACHWORKS_API_KEY and MONDAY_API_TOKEN
 python sync.py --diagnose-teachworks --lookback-days 30
 ```
 
-Read-only. Fires eight `/lessons` request variants directly at Teachworks so
+Read-only. Fires nine `/lessons` request variants directly at Teachworks so
 you can see exactly which query parameter is causing a zero-result (or
-wrong-result) response, without needing to touch or even instantiate
-Monday.com:
+wrong-result) response, then runs a full pagination walk — without needing
+to touch or even instantiate Monday.com:
 
 1. `page`/`per_page` only — no `status`, no dates.
 2. `from_date`/`to_date` together — no `status`.
@@ -123,10 +123,19 @@ Monday.com:
    confirmed via diagnostics to have an Attended record) as
    `from_date=to_date`, no `status`.
 8. That same known-good day, with `status=Attended` added.
+9. A known-recent day (`KNOWN_RECENT_DATE_WITH_EXPECTED_SESSIONS` in
+   `sync.py`) the prior process reported 10 sessions for, with `status=Attended`.
 
 For each variant it prints only the request parameter names/values, the
 HTTP status code, how many records came back, and the first record's raw
 JSON if any — never headers, never the API key/token.
+
+It then runs a **pagination diagnostic**: walks every `/lessons` page for
+`status=Attended` with no date filters at all (capped at `MAX_DIAGNOSTIC_PAGES`,
+default 500, with a clear warning if the cap is hit), and reports total pages
+fetched, total lessons seen, and the earliest/latest `from_date` across all
+of them — without printing every individual lesson. This shows the full
+extent of what this credential can actually see.
 
 ## 4. Dry run (no writes — safe to run anytime)
 

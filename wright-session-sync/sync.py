@@ -32,6 +32,13 @@ logger = logging.getLogger("wright_sync")
 # isolating date-filter behavior.
 KNOWN_GOOD_HISTORICAL_DATE = "2017-07-18"
 
+# A 2026 date the prior Wright process reported 10 Attended sessions for,
+# used to test whether "recent" dates behave differently from historical ones.
+KNOWN_RECENT_DATE_WITH_EXPECTED_SESSIONS = "2026-09-13"
+
+# Safety cap for the read-only pagination diagnostic below.
+MAX_DIAGNOSTIC_PAGES = 500
+
 
 @dataclass
 class SyncReport:
@@ -182,6 +189,12 @@ def diagnose_teachworks(tw_client, start_date, end_date):
             "status": "Attended", "from_date": KNOWN_GOOD_HISTORICAL_DATE, "to_date": KNOWN_GOOD_HISTORICAL_DATE,
             "page": 1, "per_page": 10,
         }),
+        (f"9. known-recent day {KNOWN_RECENT_DATE_WITH_EXPECTED_SESSIONS} (expected 10 sessions) + status=Attended", {
+            "status": "Attended",
+            "from_date": KNOWN_RECENT_DATE_WITH_EXPECTED_SESSIONS,
+            "to_date": KNOWN_RECENT_DATE_WITH_EXPECTED_SESSIONS,
+            "page": 1, "per_page": 100,
+        }),
     ]
 
     print("=" * 70)
@@ -210,10 +223,70 @@ def diagnose_teachworks(tw_client, start_date, end_date):
             if isinstance(payload, dict):
                 print(f"Top-level response keys: {list(payload.keys())}")
 
+    diagnose_teachworks_pagination(tw_client)
+
     print("\n" + "=" * 70)
     print("DIAGNOSTIC COMPLETE - no Monday.com calls and no writes were made.")
     print("=" * 70)
     return 0
+
+
+def diagnose_teachworks_pagination(tw_client, status="Attended", per_page=100, max_pages=MAX_DIAGNOSTIC_PAGES):
+    """Read-only: walks every /lessons page for `status` with NO date filters,
+    to see the full extent of what this credential can see. Does not print
+    individual lessons — only aggregate counts and the earliest/latest
+    `from_date` observed. Capped at `max_pages` for safety; clearly reports
+    if that cap is hit. Zero Monday.com calls, zero writes."""
+    print("\n" + "=" * 70)
+    print(f"TEACHWORKS PAGINATION DIAGNOSTIC (status={status}, no date filters, cap={max_pages} pages)")
+    print("Read-only. Does not print individual lessons.")
+    print("=" * 70)
+
+    total_lessons = 0
+    earliest = None
+    latest = None
+    pages_fetched = 0
+    cap_reached = False
+
+    for page in range(1, max_pages + 1):
+        try:
+            status_code, payload, records = tw_client.diagnostic_get(
+                "/lessons", {"status": status, "page": page, "per_page": per_page}
+            )
+        except Exception as exc:  # noqa: BLE001 - report and stop rather than crash the whole diagnostic
+            print(f"REQUEST ERROR on page {page}: {exc}")
+            break
+
+        pages_fetched = page
+
+        if status_code != 200:
+            print(f"Stopping: page {page} returned HTTP {status_code}.")
+            break
+        if records is None:
+            print(f"Stopping: page {page} response did not contain a recognizable record list.")
+            break
+
+        total_lessons += len(records)
+        for record in records:
+            record_date = record.get("from_date") if isinstance(record, dict) else None
+            if record_date:
+                if earliest is None or record_date < earliest:
+                    earliest = record_date
+                if latest is None or record_date > latest:
+                    latest = record_date
+
+        if len(records) < per_page:
+            break
+    else:
+        cap_reached = True
+
+    print(f"Total pages fetched: {pages_fetched}")
+    print(f"Total lessons: {total_lessons}")
+    print(f"Earliest from_date seen: {earliest}")
+    print(f"Latest from_date seen: {latest}")
+    if cap_reached:
+        print(f"WARNING: safety cap of {max_pages} pages was reached. There is likely more data beyond this point.")
+    print("=" * 70)
 
 
 def print_report(report):
