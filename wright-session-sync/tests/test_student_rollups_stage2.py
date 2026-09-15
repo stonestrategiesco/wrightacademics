@@ -379,3 +379,45 @@ def test_cli_refuses_student_rollups_without_dry_run(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert exit_code == 1
     assert "only supports --dry-run" in out
+
+
+def test_cli_end_to_end_student_rollups_dry_run_classifies_and_totals_correctly(monkeypatch, capsys):
+    """End-to-end: invokes the SAME CLI path Railway invokes -
+    argparse -> main() -> dispatch -> run_student_rollup_dry_run() ->
+    compute_student_rollup_updates() - not the functions directly. Uses
+    4 students: 1 with a new session, 2 matched with zero new sessions,
+    1 with a blank Teachworks Student ID."""
+    import config as config_module
+    import sync
+
+    monkeypatch.setattr(config_module, "TEACHWORKS_API_KEY", "fake-key")
+    monkeypatch.setattr(config_module, "MONDAY_API_TOKEN", "fake-token")
+
+    monday = WriteGuardedMondayClient(
+        items=[_session_row("s1", "111", "2026-09-12", "Jane")],  # 1 new session, for student 111 only
+        student_items=[
+            _student_row("m1", "111", item_name="Alice", session_count="2", last_synced="2026-09-10"),  # new session -> rollup
+            _student_row("m2", "222", item_name="Bob", session_count="5", last_session="2026-09-01", tutor="Ben", last_synced="2026-09-10"),  # 0 new -> checkpoint-only
+            _student_row("m3", "333", item_name="Carol", session_count="1", last_session="2026-08-01", tutor="Cara", last_synced="2026-09-10"),  # 0 new -> checkpoint-only
+            _student_row("m4", tw_student_id="", item_name="No ID"),  # blank Teachworks ID -> skipped
+        ],
+    )
+
+    monkeypatch.setattr(sync, "TeachworksClient", lambda **kwargs: object())
+    monkeypatch.setattr(sync, "MondayClient", lambda **kwargs: monday)
+
+    exit_code = sync.main(["--student-rollups", "--dry-run"])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Students evaluated: 4" in out
+    assert "Students receiving rollup updates: 1" in out
+    assert "Students receiving checkpoint-only updates: 2" in out
+    assert "Students skipped because they cannot be matched: 1" in out
+    assert "Total Student items that WOULD be written: 3" in out
+
+    # zero Monday writes in dry-run mode - WriteGuardedMondayClient would
+    # have raised if create_session_item/connect_student/update_student_columns
+    # were ever called; these assertions are the additional passive proof.
+    assert monday.created_items == []
+    assert monday.connections == []
