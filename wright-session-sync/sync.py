@@ -1032,6 +1032,53 @@ def run_student_rollup_apply(monday_client, today=None):
     return 1 if outcome["failed"] else 0
 
 
+def diagnose_checkpoint_migration_readiness(monday_client, sample_size=5):
+    """Read-only: gathers the two facts needed before considering a move
+    from a date-only rollup checkpoint to a datetime one:
+
+    A. The raw settings_str for the Session Data Last Synced column
+       (STUDENT_COL_SESSION_DATA_LAST_SYNCED), to inspect whether time is
+       enabled/supported on this actual column.
+    B. A small sample of real Session Log items with their session_date,
+       created_at, and Teachworks Student ID, to see the exact format/
+       timezone Monday returns for created_at.
+
+    Uses two new, isolated MondayClient methods
+    (get_column_settings / get_sample_items_with_created_at) - neither is
+    called by get_items()/_iter_board_items() or any production path.
+    Makes ZERO Monday writes. Does not change run_sync(), the Session Log
+    creation pipeline, dedup, or any rollup calculation."""
+    print("=" * 70)
+    print("CHECKPOINT MIGRATION READINESS DIAGNOSTIC (read-only, zero Monday writes)")
+    print("=" * 70)
+
+    print("\n--- A: Session Data Last Synced column settings ---")
+    column = monday_client.get_column_settings(config.MONDAY_STUDENTS_BOARD_ID, config.STUDENT_COL_SESSION_DATA_LAST_SYNCED)
+    print(f"Column ID: {column.get('id')}")
+    print(f"Title: {column.get('title')}")
+    print(f"Type: {column.get('type')}")
+    print(f"Raw settings_str: {column.get('settings_str')}")
+
+    print(f"\n--- B: Sample of {sample_size} Session Log item(s) with created_at ---")
+    sample_columns = [config.COL_SESSION_DATE, config.COL_TEACHWORKS_STUDENT_ID]
+    sample = monday_client.get_sample_items_with_created_at(config.MONDAY_SESSIONS_BOARD_ID, sample_columns, limit=sample_size)
+    if not sample:
+        print("No Session Log items found.")
+    for item in sample:
+        cols = item["columns"]
+        print(
+            f"  item_id={item['item_id']} "
+            f"session_date={cols.get(config.COL_SESSION_DATE) or '(blank)'} "
+            f"created_at={item.get('created_at')} "
+            f"teachworks_student_id={cols.get(config.COL_TEACHWORKS_STUDENT_ID) or '(blank)'}"
+        )
+
+    print("\n" + "=" * 70)
+    print("DIAGNOSTIC COMPLETE - read-only. Zero Monday writes were made.")
+    print("=" * 70)
+    return 0
+
+
 def run_student_rollup_dry_run(monday_client, today=None):
     """Stage 2, combined dry run: runs the real rollup calculation
     (compute_student_rollup_updates) and reports it. Makes ZERO Monday
@@ -1175,6 +1222,7 @@ def main(argv=None):
     parser.add_argument("--diagnose-student-rollups", action="store_true", help="Read-only: calculate lifetime student rollups from the Session Log board and compare against current Monday Student values. Reads Monday.com but makes zero writes and zero Teachworks requests.")
     parser.add_argument("--diagnose-student-rollup-delta", action="store_true", help="Read-only: validate a baseline+delta rollup approach for students whose current Session Data Last Synced equals --baseline-date. Reads Monday.com but makes zero writes.")
     parser.add_argument("--baseline-date", default=None, help="YYYY-MM-DD baseline date, required by --diagnose-student-rollup-delta.")
+    parser.add_argument("--diagnose-checkpoint-migration", action="store_true", help="Read-only: inspect the Session Data Last Synced column's settings and a sample of Session Log items' created_at, ahead of any datetime-checkpoint migration. Reads Monday.com but makes zero writes.")
     parser.add_argument("--student-rollups", action="store_true", help="Calculate production-ready Student rollup updates (baseline+delta, per-student checkpoint). Combine with --dry-run to preview, or --apply to perform the real Monday writes.")
     parser.add_argument("--apply", action="store_true", help="Perform REAL Monday writes for --student-rollups. Writes never happen just because --dry-run is absent - --apply must be passed explicitly.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (default INFO).")
@@ -1230,6 +1278,9 @@ def main(argv=None):
             print("ERROR: --diagnose-student-rollup-delta requires --baseline-date YYYY-MM-DD")
             return 1
         return diagnose_student_rollup_delta(monday_client, args.baseline_date)
+
+    if args.diagnose_checkpoint_migration:
+        return diagnose_checkpoint_migration_readiness(monday_client)
 
     if args.student_rollups:
         if args.apply and args.dry_run:

@@ -73,6 +73,64 @@ def test_get_board_columns_raises_if_board_not_found():
         client.get_board_columns(18413873041)
 
 
+def test_get_column_settings_returns_settings_str():
+    session = MagicMock()
+    session.post.return_value = _response(200, {
+        "data": {
+            "boards": [{
+                "columns": [
+                    {"id": "date_mm5gk46f", "title": "Session Data Last Synced", "type": "date", "settings_str": '{"time_enabled":true}'},
+                ],
+            }],
+        },
+    })
+
+    client = MondayClient(api_token="token", session=session)
+    column = client.get_column_settings(18413873041, "date_mm5gk46f")
+
+    assert column == {
+        "id": "date_mm5gk46f", "title": "Session Data Last Synced", "type": "date",
+        "settings_str": '{"time_enabled":true}',
+    }
+
+
+def test_get_column_settings_raises_if_column_not_found():
+    session = MagicMock()
+    session.post.return_value = _response(200, {"data": {"boards": [{"columns": []}]}})
+
+    client = MondayClient(api_token="token", session=session)
+    with pytest.raises(MondayAPIError):
+        client.get_column_settings(18413873041, "nonexistent_col")
+
+
+def test_get_sample_items_with_created_at_returns_created_at_per_item():
+    session = MagicMock()
+    session.post.return_value = _response(200, {
+        "data": {
+            "boards": [{
+                "items_page": {
+                    "items": [
+                        {
+                            "id": "1", "name": "a", "created_at": "2026-09-16T01:23:45Z",
+                            "column_values": [{"id": "date_col", "text": "2026-09-15", "value": None}],
+                        },
+                    ],
+                },
+            }],
+        },
+    })
+
+    client = MondayClient(api_token="token", session=session)
+    sample = client.get_sample_items_with_created_at(18423473385, ["date_col"], limit=5)
+
+    assert sample == [{
+        "item_id": "1", "item_name": "a", "created_at": "2026-09-16T01:23:45Z",
+        "columns": {"date_col": "2026-09-15"},
+    }]
+    request_variables = session.post.call_args.kwargs["json"]["variables"]
+    assert request_variables["limit"] == 5
+
+
 def test_get_items_returns_multiple_columns_per_item_and_paginates():
     session = MagicMock()
     session.post.side_effect = [

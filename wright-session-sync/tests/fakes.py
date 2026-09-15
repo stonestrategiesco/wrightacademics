@@ -17,7 +17,8 @@ class FakeTeachworksClient(TeachworksClient):
 
 
 class FakeMondayClient:
-    def __init__(self, existing_ids=None, student_lookup=None, items=None, student_items=None, board_columns=None):
+    def __init__(self, existing_ids=None, student_lookup=None, items=None, student_items=None,
+                 board_columns=None, column_settings=None, created_at_by_item_id=None):
         self.existing_ids = set(existing_ids or [])
         self.student_lookup = dict(student_lookup or {})
         # items: list of {"item_id": ..., "item_name": ..., "columns": {col_id: text}},
@@ -28,6 +29,11 @@ class FakeMondayClient:
         self.student_items = list(student_items or [])
         # board_columns: list of {"id": ..., "title": ..., "type": ...}, used by get_board_columns()
         self.board_columns = list(board_columns or [])
+        # column_settings: {column_id: {"id":..., "title":..., "type":..., "settings_str":...}}
+        self.column_settings = dict(column_settings or {})
+        # created_at_by_item_id: {"item_id": "2026-09-16T01:23:45Z"} used by
+        # get_sample_items_with_created_at() to serve created_at per item in `items`.
+        self.created_at_by_item_id = dict(created_at_by_item_id or {})
         self.created_items = []
         self.connections = []
         self.student_updates = []
@@ -80,6 +86,21 @@ class FakeMondayClient:
 
     def get_board_columns(self, board_id):
         return list(self.board_columns)
+
+    def get_column_settings(self, board_id, column_id):
+        return self.column_settings.get(column_id, {"id": column_id, "title": "", "type": "", "settings_str": ""})
+
+    def get_sample_items_with_created_at(self, board_id, column_ids, limit=5):
+        source = self.student_items if board_id == config.MONDAY_STUDENTS_BOARD_ID else self.items
+        results = []
+        for item in source[:limit]:
+            results.append({
+                "item_id": item["item_id"],
+                "item_name": item.get("item_name", ""),
+                "created_at": self.created_at_by_item_id.get(item["item_id"]),
+                "columns": {col: item["columns"].get(col, "") for col in column_ids},
+            })
+        return results
 
     def update_student_columns(self, board_id, item_id, column_values):
         if self.update_student_side_effect is not None:

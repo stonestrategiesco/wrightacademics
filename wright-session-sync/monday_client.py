@@ -184,6 +184,70 @@ class MondayClient:
             raise MondayAPIError(f"Monday board {board_id} not found or not accessible with this token")
         return boards[0]["columns"]
 
+    def get_column_settings(self, board_id, column_id):
+        """Read-only diagnostic: return one column's id/title/type/settings_str
+        (the raw JSON Monday stores for that column's configuration - e.g.
+        whether a date column has time enabled). Deliberately separate from
+        get_board_columns() (used by the earlier discovery diagnostic) so
+        neither method's contract changes. Makes no writes of any kind."""
+        query = """
+        query ($boardId: [ID!], $columnIds: [String!]) {
+          boards(ids: $boardId) {
+            columns(ids: $columnIds) {
+              id
+              title
+              type
+              settings_str
+            }
+          }
+        }
+        """
+        data = self._execute(query, {"boardId": [str(board_id)], "columnIds": [column_id]})
+        boards = data.get("boards") or []
+        if not boards:
+            raise MondayAPIError(f"Monday board {board_id} not found or not accessible with this token")
+        columns = boards[0]["columns"]
+        if not columns:
+            raise MondayAPIError(f"Column {column_id} not found on board {board_id}")
+        return columns[0]
+
+    def get_sample_items_with_created_at(self, board_id, column_ids, limit=5):
+        """Read-only diagnostic: fetch a SMALL sample (first page only, not
+        the whole board) of items including each item's `created_at`.
+        Deliberately a separate method from get_items()/_iter_board_items()
+        - which the production pipeline uses and which do NOT request
+        created_at - so nothing already in production use is touched.
+        Makes no writes of any kind."""
+        query = """
+        query ($boardId: [ID!], $limit: Int, $columnIds: [String!]) {
+          boards(ids: $boardId) {
+            items_page(limit: $limit) {
+              items {
+                id
+                name
+                created_at
+                column_values(ids: $columnIds) { id text value }
+              }
+            }
+          }
+        }
+        """
+        data = self._execute(query, {"boardId": [str(board_id)], "limit": limit, "columnIds": column_ids})
+        boards = data.get("boards") or []
+        if not boards:
+            raise MondayAPIError(f"Monday board {board_id} not found or not accessible with this token")
+        items = boards[0]["items_page"]["items"]
+        results = []
+        for item in items:
+            columns = {column_id: self._column_text(item, column_id) for column_id in column_ids}
+            results.append({
+                "item_id": item["id"],
+                "item_name": item.get("name"),
+                "created_at": item.get("created_at"),
+                "columns": columns,
+            })
+        return results
+
     def get_student_lookup(self, board_id, teachworks_id_column):
         """Return {teachworks_student_id (str): monday_item_id (str)} for every
         Student item that has a Teachworks Student ID populated."""
