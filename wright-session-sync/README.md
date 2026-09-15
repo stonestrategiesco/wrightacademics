@@ -243,21 +243,24 @@ touching all ~1,096 every night) and uses each student's own **current**
 - Session Log rows are deduplicated by their own unique-ID column before
   counting, so a stray duplicate Monday item never double-counts a session.
 - If new sessions exist: proposed count = current + new sessions; proposed
-  last session/tutor = the latest new session's date/tutor; the checkpoint
-  would advance to the run date (not the session date — it means "as of
-  when this last ran").
-- If no new sessions exist: count, last session, tutor, and the checkpoint
-  are all left exactly as they are — this is what keeps most students
-  untouched on any given night.
+  last session/tutor = the latest new session's date/tutor ("a rollup
+  update").
+- If no new sessions exist: count, last session, tutor, and First Session
+  Date are all left exactly as they are ("a checkpoint-only update").
+- **Every matched student's checkpoint (`Session Data Last Synced`) always
+  advances to the run date**, whether or not it had new sessions — this is
+  what lets the next run compare against "as of when this last ran" even
+  for a student with nothing new, without ever touching its other fields.
 - A Student item with a **blank Teachworks Student ID** can't be matched at
-  all; it's logged and skipped, never modified, never created.
+  all; it's logged and skipped — no write, no checkpoint, never created.
 
 Report format: `Student | Current Count | New Sessions | Proposed Count |
 Current Last Session | Proposed Last Session | Current Tutor | Proposed
 Tutor`, for students with at least one new session, followed by a summary:
-students evaluated, students with new sessions, total new sessions
-represented, students with no changes, missing Monday students, and
-students that WOULD be updated.
+students evaluated, students with new sessions, total new sessions,
+students receiving rollup updates, students receiving checkpoint-only
+updates, students skipped because they cannot be matched, and total
+Student items that WOULD be written (rollup + checkpoint-only combined).
 
 ## 6. Investigating zero (or unexpected) duplicate-detection results
 

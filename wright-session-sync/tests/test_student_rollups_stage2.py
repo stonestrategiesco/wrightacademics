@@ -106,23 +106,31 @@ def test_latest_tutor_tie_on_same_date_broken_deterministically():
     assert results[0]["proposed_tutor"] == "Later Item"
 
 
-# --- Zero-session students (no new sessions -> nothing changes) ----------
+# --- Zero-session students get a checkpoint-only update -------------------
 
-def test_zero_new_sessions_leaves_everything_unchanged():
+def test_zero_new_sessions_gets_checkpoint_only_update():
+    """Required test 2: a student with 0 new sessions still gets its
+    checkpoint advanced to the run date, but every substantive field
+    (count, last session, tutor, and First Session Date, which isn't even
+    read here) is left exactly as it was."""
     monday = FakeMondayClient(
         items=[],  # no Session Log rows for this student at all
-        student_items=[_student_row("m1", "111", session_count="7", last_session="2026-09-01", tutor="Steady", last_synced="2026-09-10")],
+        student_items=[_student_row(
+            "m1", "111", first_session="2020-05-01",
+            session_count="7", last_session="2026-09-01", tutor="Steady", last_synced="2026-09-10",
+        )],
     )
     results = compute_student_rollup_updates(monday, today="2026-09-15")
     r = results[0]
     assert r["has_new_sessions"] is False
-    assert r["proposed_count"] == 7
-    assert r["proposed_last_session"] == "2026-09-01"
-    assert r["proposed_tutor"] == "Steady"
-    assert r["new_checkpoint"] == "2026-09-10"  # checkpoint NOT advanced
+    assert r["update_kind"] == "checkpoint_only"
+    assert r["proposed_count"] == 7  # unchanged
+    assert r["proposed_last_session"] == "2026-09-01"  # unchanged
+    assert r["proposed_tutor"] == "Steady"  # unchanged
+    assert r["new_checkpoint"] == "2026-09-15"  # checkpoint ALWAYS advances for matched students
 
 
-def test_checkpoint_only_advances_when_new_sessions_exist():
+def test_checkpoint_always_advances_to_run_date_for_every_matched_student():
     with_new = compute_student_rollup_updates(
         FakeMondayClient(
             items=[_session_row("s1", "111", "2026-09-12", "Jane")],
@@ -138,22 +146,100 @@ def test_checkpoint_only_advances_when_new_sessions_exist():
         today="2026-09-15",
     )[0]
 
-    assert with_new["new_checkpoint"] == "2026-09-15"  # advanced to run date
-    assert without_new["new_checkpoint"] == "2026-09-10"  # unchanged
+    assert with_new["new_checkpoint"] == "2026-09-15"
+    assert with_new["update_kind"] == "rollup"
+    assert without_new["new_checkpoint"] == "2026-09-15"  # advances even with zero new sessions
+    assert without_new["update_kind"] == "checkpoint_only"
+
+
+def test_one_new_session_gets_rollup_fields_and_checkpoint():
+    """Required test 1."""
+    monday = FakeMondayClient(
+        items=[_session_row("s1", "111", "2026-09-12", "New Tutor")],
+        student_items=[_student_row("m1", "111", session_count="3", last_session="2026-09-01", tutor="Old Tutor", last_synced="2026-09-10")],
+    )
+    r = compute_student_rollup_updates(monday, today="2026-09-15")[0]
+    assert r["new_session_count"] == 1
+    assert r["proposed_count"] == 4
+    assert r["proposed_last_session"] == "2026-09-12"
+    assert r["proposed_tutor"] == "New Tutor"
+    assert r["new_checkpoint"] == "2026-09-15"
+    assert r["update_kind"] == "rollup"
+
+
+def test_two_new_sessions_increments_count_by_two():
+    """Required test 3."""
+    monday = FakeMondayClient(
+        items=[
+            _session_row("s1", "111", "2026-09-11", "Tutor A"),
+            _session_row("s2", "111", "2026-09-12", "Tutor B"),
+        ],
+        student_items=[_student_row("m1", "111", session_count="10", last_synced="2026-09-10")],
+    )
+    r = compute_student_rollup_updates(monday, today="2026-09-15")[0]
+    assert r["new_session_count"] == 2
+    assert r["proposed_count"] == 12
+
+
+def test_second_run_with_advanced_checkpoint_finds_zero_new_sessions():
+    """Required test 5: run once, take the resulting checkpoint, feed it
+    back as the student's stored checkpoint for a second run where no new
+    Session Log rows were added - the second run must find zero new
+    sessions and only checkpoint-advance, not double count."""
+    session_log = [
+        _session_row("s1", "111", "2026-09-11", "Jane"),
+        _session_row("s2", "111", "2026-09-12", "Jane"),
+    ]
+    first_run = compute_student_rollup_updates(
+        FakeMondayClient(
+            items=session_log,
+            student_items=[_student_row("m1", "111", session_count="5", last_synced="2026-09-10")],
+        ),
+        today="2026-09-15",
+    )[0]
+    assert first_run["new_session_count"] == 2
+    assert first_run["proposed_count"] == 7
+    assert first_run["new_checkpoint"] == "2026-09-15"
+
+    # Second run: same Session Log data (nothing new added), student now
+    # carries the checkpoint/count/etc. produced by the first run.
+    second_run = compute_student_rollup_updates(
+        FakeMondayClient(
+            items=session_log,
+            student_items=[_student_row(
+                "m1", "111",
+                session_count=str(first_run["proposed_count"]),
+                last_session=first_run["proposed_last_session"],
+                tutor=first_run["proposed_tutor"],
+                last_synced=first_run["new_checkpoint"],
+            )],
+        ),
+        today="2026-09-16",
+    )[0]
+
+    assert second_run["new_session_count"] == 0
+    assert second_run["proposed_count"] == 7  # unchanged, not double-counted
+    assert second_run["update_kind"] == "checkpoint_only"
+    assert second_run["new_checkpoint"] == "2026-09-16"
 
 
 # --- Missing / unmatched students ------------------------------------------
 
-def test_student_with_blank_teachworks_id_is_reported_as_unmatched_not_created():
+def test_student_with_blank_teachworks_id_gets_no_write_and_no_checkpoint():
+    """Required test 4: a Student item with a blank/missing Teachworks
+    Student ID must not be updated and must not receive a checkpoint."""
     monday = WriteGuardedMondayClient(
         items=[],
         student_items=[_student_row("m1", tw_student_id="", item_name="No ID Student")],
     )
     results = compute_student_rollup_updates(monday, today="2026-09-15")
     assert len(results) == 1
-    assert results[0]["matched"] is False
-    assert results[0]["student_name"] == "No ID Student"
-    assert results[0]["monday_item_id"] == "m1"
+    r = results[0]
+    assert r["matched"] is False
+    assert r["update_kind"] is None
+    assert "new_checkpoint" not in r  # no checkpoint at all
+    assert r["student_name"] == "No ID Student"
+    assert r["monday_item_id"] == "m1"
 
 
 def test_dry_run_reports_unmatched_student_in_output_and_summary(capsys):
@@ -164,9 +250,11 @@ def test_dry_run_reports_unmatched_student_in_output_and_summary(capsys):
     run_student_rollup_dry_run(monday, today="2026-09-15")
     out = capsys.readouterr().out
     assert "could not be matched" in out
+    assert "NO checkpoint" in out
     assert "No ID Student" in out
     assert "Students evaluated: 1" in out
-    assert "Missing Monday students: 1" in out
+    assert "Students skipped because they cannot be matched: 1" in out
+    assert "Total Student items that WOULD be written: 0" in out
 
 
 # --- Blank checkpoint handling ---------------------------------------------
@@ -261,10 +349,11 @@ def test_dry_run_summary_and_table_are_correct(capsys):
     assert "Bob | 5 |" not in out  # Bob has no new sessions - not shown as a row
     assert "Students evaluated: 2" in out
     assert "Students with new sessions: 1" in out
-    assert "Total new sessions represented in student rollups: 1" in out
-    assert "Students with no changes: 1" in out
-    assert "Missing Monday students: 0" in out
-    assert "Students that WOULD be updated: 1" in out
+    assert "Total new sessions: 1" in out
+    assert "Students receiving rollup updates: 1" in out
+    assert "Students receiving checkpoint-only updates: 1" in out  # Bob
+    assert "Students skipped because they cannot be matched: 0" in out
+    assert "Total Student items that WOULD be written: 2" in out  # Alice (rollup) + Bob (checkpoint-only)
 
 
 def test_dry_run_never_calls_update_student_columns_even_when_changes_exist():

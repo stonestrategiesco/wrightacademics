@@ -819,16 +819,19 @@ def compute_student_rollup_updates(monday_client, today=None):
     comparison: "" sorts before any real date). New sessions = Session Log
     rows with session_date strictly greater than the checkpoint.
 
-    If new sessions exist: proposed count = current count + new session
-    count; proposed last session / tutor = the latest new session's date/
-    tutor; the checkpoint WOULD advance to `today` (the run date - not the
-    session date, since the checkpoint means "as of when this last ran",
-    matching the original Stage 1 definition).
-    If no new sessions exist: count, last session, tutor, and checkpoint
-    are all left exactly as they are.
+    Every successfully MATCHED student receives Session Data Last Synced =
+    `today` (the run date), whether or not it has new sessions - this is
+    what "checkpoint-only" updates are for, so the checkpoint always
+    reflects "as of when this last ran" even for students with nothing new.
+
+    If new sessions exist: count, last session date, and tutor all update
+    (a "rollup update"). If no new sessions exist: count, last session,
+    tutor, and First Session Date are all left exactly as they are - ONLY
+    the checkpoint moves (a "checkpoint-only" update).
 
     A Student item with a blank Teachworks Student ID cannot be matched at
-    all; it's reported as unmatched, never modified, never created.
+    all; it's reported as unmatched, receives NO checkpoint and NO write of
+    any kind, and is never created.
 
     Returns a list of per-student result dicts."""
     today = today or datetime.date.today().isoformat()
@@ -850,6 +853,7 @@ def compute_student_rollup_updates(monday_client, today=None):
                 "student_name": student_name,
                 "teachworks_student_id": None,
                 "matched": False,
+                "update_kind": None,
             })
             continue
 
@@ -870,11 +874,13 @@ def compute_student_rollup_updates(monday_client, today=None):
         if has_new_sessions:
             proposed_last_session = new_rows[-1][0]
             proposed_tutor = new_rows[-1][2]
-            new_checkpoint = today
         else:
             proposed_last_session = current_last_session
             proposed_tutor = current_tutor
-            new_checkpoint = checkpoint
+
+        # Every matched student gets the checkpoint advanced to the run
+        # date, regardless of whether it has new sessions.
+        new_checkpoint = today
 
         results.append({
             "monday_item_id": item["item_id"],
@@ -891,6 +897,7 @@ def compute_student_rollup_updates(monday_client, today=None):
             "checkpoint_used": checkpoint or "(none - all sessions treated as new)",
             "new_checkpoint": new_checkpoint,
             "has_new_sessions": has_new_sessions,
+            "update_kind": "rollup" if has_new_sessions else "checkpoint_only",
         })
     return results
 
@@ -904,46 +911,54 @@ def run_student_rollup_dry_run(monday_client, today=None):
 
     print("=" * 70)
     print("STUDENT ROLLUP - COMBINED DRY RUN (Stage 2, zero Monday writes)")
-    print(f"Run date (would become the new checkpoint for updated students only): {today}")
+    print(f"Run date (every matched student's checkpoint would advance to this date): {today}")
     print("=" * 70)
 
     results = compute_student_rollup_updates(monday_client, today=today)
 
     unmatched = [r for r in results if not r["matched"]]
     matched = [r for r in results if r["matched"]]
-    with_new_sessions = [r for r in matched if r["has_new_sessions"]]
-    no_changes = [r for r in matched if not r["has_new_sessions"]]
-    total_new_sessions = sum(r["new_session_count"] for r in with_new_sessions)
+    rollup_updates = [r for r in matched if r["update_kind"] == "rollup"]
+    checkpoint_only = [r for r in matched if r["update_kind"] == "checkpoint_only"]
+    total_new_sessions = sum(r["new_session_count"] for r in rollup_updates)
+    total_would_write = len(rollup_updates) + len(checkpoint_only)
 
     if unmatched:
-        print(f"\n{len(unmatched)} Student item(s) could not be matched (blank Teachworks Student ID) - logged, not created/modified:")
+        print(f"\n{len(unmatched)} Student item(s) could not be matched (blank Teachworks Student ID) - logged, skipped, NO checkpoint:")
         for r in sorted(unmatched, key=lambda r: r["student_name"]):
             print(f"  Monday item {r['monday_item_id']} ({r['student_name']}): no Teachworks Student ID - skipped")
 
-    if with_new_sessions:
+    if rollup_updates:
         header = (
             "Student | Current Count | New Sessions | Proposed Count | "
             "Current Last Session | Proposed Last Session | Current Tutor | Proposed Tutor"
         )
         print(f"\n{header}")
         print("-" * len(header))
-        for r in sorted(with_new_sessions, key=lambda r: r["student_name"]):
+        for r in sorted(rollup_updates, key=lambda r: r["student_name"]):
             print(
                 f"{r['student_name']} | {r['current_count']} | {r['new_session_count']} | {r['proposed_count']} | "
                 f"{r['current_last_session']} | {r['proposed_last_session']} | {r['current_tutor']} | {r['proposed_tutor']}"
             )
     else:
-        print("\nNo students have new sessions since their own checkpoint - nothing would change.")
+        print("\nNo students have new sessions since their own checkpoint.")
+
+    print(
+        f"\n{len(checkpoint_only)} student(s) have zero new sessions and would receive a "
+        f"checkpoint-only update (Session Data Last Synced -> {today}; Session Count, "
+        "Last Session Date, Tutor, and First Session Date all left unchanged)."
+    )
 
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
     print(f"Students evaluated: {len(results)}")
-    print(f"Students with new sessions: {len(with_new_sessions)}")
-    print(f"Total new sessions represented in student rollups: {total_new_sessions}")
-    print(f"Students with no changes: {len(no_changes)}")
-    print(f"Missing Monday students: {len(unmatched)}")
-    print(f"Students that WOULD be updated: {len(with_new_sessions)}")
+    print(f"Students with new sessions: {len(rollup_updates)}")
+    print(f"Total new sessions: {total_new_sessions}")
+    print(f"Students receiving rollup updates: {len(rollup_updates)}")
+    print(f"Students receiving checkpoint-only updates: {len(checkpoint_only)}")
+    print(f"Students skipped because they cannot be matched: {len(unmatched)}")
+    print(f"Total Student items that WOULD be written: {total_would_write}")
 
     print("\n" + "=" * 70)
     print("DIAGNOSTIC COMPLETE - read-only. Zero Monday writes were made.")
