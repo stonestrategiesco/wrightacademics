@@ -365,7 +365,7 @@ def test_dry_run_never_calls_update_student_columns_even_when_changes_exist():
     run_student_rollup_dry_run(monday, today="2026-09-15")
 
 
-def test_cli_refuses_student_rollups_without_dry_run(monkeypatch, capsys):
+def test_cli_refuses_student_rollups_without_dry_run_or_apply(monkeypatch, capsys):
     import config as config_module
     import sync
 
@@ -374,11 +374,27 @@ def test_cli_refuses_student_rollups_without_dry_run(monkeypatch, capsys):
     monkeypatch.setattr(sync, "TeachworksClient", lambda **kwargs: object())
     monkeypatch.setattr(sync, "MondayClient", lambda **kwargs: WriteGuardedMondayClient())
 
-    exit_code = sync.main(["--student-rollups"])  # no --dry-run
+    exit_code = sync.main(["--student-rollups"])  # no --dry-run, no --apply
 
     out = capsys.readouterr().out
     assert exit_code == 1
-    assert "only supports --dry-run" in out
+    assert "requires either --dry-run" in out
+
+
+def test_cli_refuses_student_rollups_with_both_dry_run_and_apply(monkeypatch, capsys):
+    import config as config_module
+    import sync
+
+    monkeypatch.setattr(config_module, "TEACHWORKS_API_KEY", "fake-key")
+    monkeypatch.setattr(config_module, "MONDAY_API_TOKEN", "fake-token")
+    monkeypatch.setattr(sync, "TeachworksClient", lambda **kwargs: object())
+    monkeypatch.setattr(sync, "MondayClient", lambda **kwargs: WriteGuardedMondayClient())
+
+    exit_code = sync.main(["--student-rollups", "--dry-run", "--apply"])
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert "not both" in out
 
 
 def test_cli_end_to_end_student_rollups_dry_run_classifies_and_totals_correctly(monkeypatch, capsys):

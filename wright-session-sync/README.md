@@ -215,18 +215,15 @@ what's changed since) as a point of comparison against Stage 1's
 full-recompute approach — it doesn't decide which one gets built, and
 doesn't write anything either way.
 
-### Stage 2 — production-ready calculation, still dry-run only
+### Stage 2 — preview (no writes)
 
 ```bash
 python sync.py --student-rollups --dry-run
 ```
 
 This is the real, production-shaped rollup logic (chosen after Stage 1's
-baseline+delta validation) — not a throwaway diagnostic — but **Student
-writes are not enabled yet**: `--student-rollups` without `--dry-run` is
-refused at the CLI level (prints an error, exits 1), and
-`MondayClient.update_student_columns()` exists and is unit-tested but is
-never called by anything reachable from `main()`.
+baseline+delta validation) — not a throwaway diagnostic — run in preview
+mode: makes zero Monday writes.
 
 Runs after the Session Log sync in the intended nightly architecture, but
 is completely separate code — it never touches `run_sync()`, dedup, the
@@ -261,6 +258,37 @@ students evaluated, students with new sessions, total new sessions,
 students receiving rollup updates, students receiving checkpoint-only
 updates, students skipped because they cannot be matched, and total
 Student items that WOULD be written (rollup + checkpoint-only combined).
+
+### Stage 3 — real writes
+
+```bash
+python sync.py --student-rollups --apply
+```
+
+Performs the actual Monday writes. **Writes never happen just because
+`--dry-run` is absent** — `--apply` must be passed explicitly (passing
+neither, or passing both together, is refused at the CLI level with a
+clear error and exit code 1). This reuses `compute_student_rollup_updates()`
+exactly as validated in Stage 2 — there is no second calculation path —
+and `MondayClient.update_student_columns()` exactly as already used by
+Stage 2's dry run (which never called it).
+
+For each matched student, every field it needs (including the checkpoint)
+is written in **one** `change_multiple_column_values` mutation:
+
+- `update_kind == "rollup"`: Session Count, Last Session Date, Tutor, and
+  Session Data Last Synced. First Session Date is never included.
+- `update_kind == "checkpoint_only"`: **only** Session Data Last Synced —
+  nothing else is sent.
+- Unmatched students (blank Teachworks Student ID): no write at all.
+
+Because everything for one student goes through a single mutation, a
+failed write leaves that student completely untouched — including its
+checkpoint, which is why **a failed write can never advance the
+checkpoint**: the same call that would move it is the one that failed. The
+error is logged and the student is reported under "Failed writes"; every
+other student is still processed. The command exits 1 if any writes
+failed (so a scheduler/monitor can flag it), 0 otherwise.
 
 ## 6. Investigating zero (or unexpected) duplicate-detection results
 

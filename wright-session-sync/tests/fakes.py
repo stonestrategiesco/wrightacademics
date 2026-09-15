@@ -30,9 +30,13 @@ class FakeMondayClient:
         self.board_columns = list(board_columns or [])
         self.created_items = []
         self.connections = []
+        self.student_updates = []
         self._next_item_id = 1000
         self.create_side_effect = None
         self.connect_side_effect = None
+        # update_student_side_effect(item_id, column_values): raise to
+        # simulate a failed write for one specific student.
+        self.update_student_side_effect = None
 
     def get_existing_unique_ids(self, board_id, unique_id_column):
         return set(self.existing_ids)
@@ -76,6 +80,16 @@ class FakeMondayClient:
 
     def get_board_columns(self, board_id):
         return list(self.board_columns)
+
+    def update_student_columns(self, board_id, item_id, column_values):
+        if self.update_student_side_effect is not None:
+            self.update_student_side_effect(item_id, column_values)
+        self.student_updates.append({
+            "board_id": board_id,
+            "item_id": item_id,
+            "column_values": dict(column_values),
+        })
+        return item_id
 
 
 def make_lesson(lesson_id, session_date, participants, tutor="Jane Tutor", service="Math", location="Online", duration=60):

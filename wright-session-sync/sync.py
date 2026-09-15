@@ -902,6 +902,136 @@ def compute_student_rollup_updates(monday_client, today=None):
     return results
 
 
+def _real_or_none(value):
+    """compute_student_rollup_updates() substitutes '(blank)' for display
+    purposes; translate that sentinel back to None (omitted from the
+    Monday write) rather than ever writing the literal string '(blank)'."""
+    return None if value in (None, "(blank)") else value
+
+
+def _student_write_column_values(result):
+    """Build the Monday column_values for ONE student's write, from a
+    compute_student_rollup_updates() result dict. NEVER includes
+    STUDENT_COL_FIRST_SESSION_DATE - First Session Date is never written.
+
+    update_kind == "rollup": Session Count, Last Session Date, Tutor, and
+    Session Data Last Synced.
+    update_kind == "checkpoint_only": ONLY Session Data Last Synced."""
+    checkpoint_value = {"date": result["new_checkpoint"]}
+
+    if result["update_kind"] == "rollup":
+        last_session = _real_or_none(result["proposed_last_session"])
+        return {
+            config.STUDENT_COL_SESSION_COUNT: result["proposed_count"],
+            config.STUDENT_COL_LAST_SESSION_DATE: {"date": last_session} if last_session else None,
+            config.STUDENT_COL_TUTOR: _real_or_none(result["proposed_tutor"]),
+            config.STUDENT_COL_SESSION_DATA_LAST_SYNCED: checkpoint_value,
+        }
+    return {config.STUDENT_COL_SESSION_DATA_LAST_SYNCED: checkpoint_value}
+
+
+def apply_student_rollup_updates(monday_client, today=None):
+    """Stage 3: performs the REAL Monday writes for the rollup calculated by
+    compute_student_rollup_updates() - reused as-is, no second calculation
+    path. Unmatched students (blank Teachworks Student ID) receive no
+    write at all.
+
+    Each student's fields (including the checkpoint) are written in ONE
+    change_multiple_column_values mutation via
+    MondayClient.update_student_columns(), so a failed write leaves EVERY
+    field for that student - the checkpoint included - completely
+    unchanged: the checkpoint only ever advances when the write actually
+    succeeds. One student's failure is logged and does NOT stop the
+    remaining students from being processed.
+
+    Returns a dict of {results, written_rollup, written_checkpoint_only,
+    skipped_unmatched, failed}."""
+    today = today or datetime.date.today().isoformat()
+    results = compute_student_rollup_updates(monday_client, today=today)
+
+    written_rollup = []
+    written_checkpoint_only = []
+    skipped_unmatched = []
+    failed = []
+
+    for r in results:
+        if not r["matched"]:
+            skipped_unmatched.append(r)
+            continue
+
+        column_values = _student_write_column_values(r)
+        try:
+            monday_client.update_student_columns(config.MONDAY_STUDENTS_BOARD_ID, r["monday_item_id"], column_values)
+        except Exception as exc:  # noqa: BLE001 - one bad student must not stop the run
+            logger.error(
+                "STUDENT_ROLLUP_WRITE_ERROR monday_item_id=%s teachworks_student_id=%s error=%s",
+                r["monday_item_id"], r["teachworks_student_id"], exc,
+            )
+            failed.append({**r, "error": str(exc)})
+            continue
+
+        if r["update_kind"] == "rollup":
+            written_rollup.append(r)
+        else:
+            written_checkpoint_only.append(r)
+
+    return {
+        "results": results,
+        "written_rollup": written_rollup,
+        "written_checkpoint_only": written_checkpoint_only,
+        "skipped_unmatched": skipped_unmatched,
+        "failed": failed,
+    }
+
+
+def run_student_rollup_apply(monday_client, today=None):
+    """Stage 3, CLI-facing: applies REAL Monday writes for student rollups
+    and reports the outcome. Only reachable via --student-rollups --apply
+    (enforced in main(), not here)."""
+    today = today or datetime.date.today().isoformat()
+
+    print("=" * 70)
+    print("STUDENT ROLLUP - APPLYING WRITES (Stage 3, REAL Monday writes)")
+    print(f"Run date / new checkpoint for successfully-updated students: {today}")
+    print("=" * 70)
+
+    outcome = apply_student_rollup_updates(monday_client, today=today)
+
+    if outcome["written_rollup"]:
+        print(f"\nRollup updates written: {len(outcome['written_rollup'])}")
+        for r in sorted(outcome["written_rollup"], key=lambda r: r["student_name"]):
+            print(
+                f"  {r['student_name']} (item {r['monday_item_id']}): count -> {r['proposed_count']}, "
+                f"last session -> {r['proposed_last_session']}, tutor -> {r['proposed_tutor']}"
+            )
+
+    print(f"\nCheckpoint-only updates written: {len(outcome['written_checkpoint_only'])}")
+
+    if outcome["skipped_unmatched"]:
+        print(f"\nSkipped (cannot be matched, no write): {len(outcome['skipped_unmatched'])}")
+        for r in sorted(outcome["skipped_unmatched"], key=lambda r: r["student_name"]):
+            print(f"  Monday item {r['monday_item_id']} ({r['student_name']}): no Teachworks Student ID")
+
+    if outcome["failed"]:
+        print(f"\nFAILED writes (checkpoint NOT advanced - will be retried next run): {len(outcome['failed'])}")
+        for r in sorted(outcome["failed"], key=lambda r: r["student_name"]):
+            print(f"  {r['student_name']} (item {r['monday_item_id']}): {r['error']}")
+
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"Students evaluated: {len(outcome['results'])}")
+    print(f"Rollup updates written: {len(outcome['written_rollup'])}")
+    print(f"Checkpoint-only updates written: {len(outcome['written_checkpoint_only'])}")
+    print(f"Skipped (cannot be matched): {len(outcome['skipped_unmatched'])}")
+    print(f"Failed writes: {len(outcome['failed'])}")
+
+    print("\n" + "=" * 70)
+    print("STUDENT ROLLUP WRITE COMPLETE.")
+    print("=" * 70)
+    return 1 if outcome["failed"] else 0
+
+
 def run_student_rollup_dry_run(monday_client, today=None):
     """Stage 2, combined dry run: runs the real rollup calculation
     (compute_student_rollup_updates) and reports it. Makes ZERO Monday
@@ -1045,7 +1175,8 @@ def main(argv=None):
     parser.add_argument("--diagnose-student-rollups", action="store_true", help="Read-only: calculate lifetime student rollups from the Session Log board and compare against current Monday Student values. Reads Monday.com but makes zero writes and zero Teachworks requests.")
     parser.add_argument("--diagnose-student-rollup-delta", action="store_true", help="Read-only: validate a baseline+delta rollup approach for students whose current Session Data Last Synced equals --baseline-date. Reads Monday.com but makes zero writes.")
     parser.add_argument("--baseline-date", default=None, help="YYYY-MM-DD baseline date, required by --diagnose-student-rollup-delta.")
-    parser.add_argument("--student-rollups", action="store_true", help="Stage 2: calculate production-ready Student rollup updates (baseline+delta, per-student checkpoint). Currently only runs combined with --dry-run; Student writes are not enabled yet.")
+    parser.add_argument("--student-rollups", action="store_true", help="Calculate production-ready Student rollup updates (baseline+delta, per-student checkpoint). Combine with --dry-run to preview, or --apply to perform the real Monday writes.")
+    parser.add_argument("--apply", action="store_true", help="Perform REAL Monday writes for --student-rollups. Writes never happen just because --dry-run is absent - --apply must be passed explicitly.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (default INFO).")
     args = parser.parse_args(argv)
 
@@ -1101,10 +1232,15 @@ def main(argv=None):
         return diagnose_student_rollup_delta(monday_client, args.baseline_date)
 
     if args.student_rollups:
-        if not args.dry_run:
-            print("ERROR: --student-rollups currently only supports --dry-run. Student writes are not enabled yet.")
+        if args.apply and args.dry_run:
+            print("ERROR: Pass either --dry-run or --apply for --student-rollups, not both.")
             return 1
-        return run_student_rollup_dry_run(monday_client)
+        if args.apply:
+            return run_student_rollup_apply(monday_client)
+        if args.dry_run:
+            return run_student_rollup_dry_run(monday_client)
+        print("ERROR: --student-rollups requires either --dry-run (preview) or --apply (real writes).")
+        return 1
 
     if args.diagnose_dedup:
         return diagnose_dedup(tw_client, monday_client, start_date, end_date)
