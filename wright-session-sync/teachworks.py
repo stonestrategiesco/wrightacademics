@@ -84,6 +84,30 @@ class TeachworksClient:
             f"Teachworks request to {path} failed after {self.max_retries} attempts: {last_error}"
         )
 
+    def diagnostic_get(self, path, params):
+        """Single, non-raising GET for read-only diagnostics ONLY (used by
+        `sync.py --diagnose-teachworks`). Unlike `_get()`, this never retries
+        and never raises on a non-2xx status — the caller needs the raw
+        status code itself to compare request variants. Returns
+        (status_code, parsed_json_or_None, records_or_None)."""
+        url = f"{self.base_url}{path}"
+        response = self.session.get(url, headers=self._auth_headers(), params=params, timeout=self.timeout)
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+
+        records = None
+        if isinstance(payload, list):
+            records = payload
+        elif isinstance(payload, dict):
+            for key in ("data", "lessons", "results", "items"):
+                if key in payload and isinstance(payload[key], list):
+                    records = payload[key]
+                    break
+
+        return response.status_code, payload, records
+
     @staticmethod
     def _extract_page(payload):
         """Normalize a page response into a plain list of records.

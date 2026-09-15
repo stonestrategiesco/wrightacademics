@@ -155,6 +155,53 @@ def run_sync(tw_client, monday_client, start_date, end_date, dry_run=False, mode
     return report
 
 
+def diagnose_teachworks(tw_client, start_date, end_date):
+    """Read-only diagnostic: fires four /lessons request variants directly
+    against Teachworks to isolate which query parameter causes a zero-result
+    response. Prints only status codes, parameter names/values, record
+    counts, and the first record's JSON — never headers or credentials.
+    Makes zero Monday.com calls and zero writes of any kind."""
+    variants = [
+        ("1. page/per_page only (no status, no dates)", {"page": 1, "per_page": 10}),
+        ("2. from_date/to_date only (no status)", {"from_date": start_date, "to_date": end_date, "page": 1, "per_page": 10}),
+        ("3. status=Attended only (no date filters)", {"status": "Attended", "page": 1, "per_page": 10}),
+        ("4. current production query (status + from_date + to_date)", {
+            "status": "Attended", "from_date": start_date, "to_date": end_date, "page": 1, "per_page": 10,
+        }),
+    ]
+
+    print("=" * 70)
+    print("TEACHWORKS DIAGNOSTIC MODE")
+    print("Read-only. Zero Monday.com calls. Zero writes of any kind.")
+    print(f"Date range used where applicable: {start_date} .. {end_date}")
+    print("=" * 70)
+
+    for label, params in variants:
+        print(f"\n--- {label} ---")
+        print(f"Request params: {params}")
+        try:
+            status_code, payload, records = tw_client.diagnostic_get("/lessons", params)
+        except Exception as exc:  # noqa: BLE001 - one variant failing must not stop the others
+            print(f"REQUEST ERROR: {exc}")
+            continue
+
+        print(f"HTTP status: {status_code}")
+        if records is not None:
+            print(f"Records returned: {len(records)}")
+            if records:
+                print("First record:")
+                print(json.dumps(records[0], indent=2, default=str))
+        else:
+            print("Records returned: could not find a list of records in the response body.")
+            if isinstance(payload, dict):
+                print(f"Top-level response keys: {list(payload.keys())}")
+
+    print("\n" + "=" * 70)
+    print("DIAGNOSTIC COMPLETE - no Monday.com calls and no writes were made.")
+    print("=" * 70)
+    return 0
+
+
 def print_report(report):
     verb_created = "Sessions that WOULD be created" if report.mode.startswith("DRY RUN") else "Sessions created"
     lines = [
@@ -227,6 +274,7 @@ def main(argv=None):
     parser.add_argument("--full", action="store_true", help="Full historical reconciliation instead of the rolling lookback window.")
     parser.add_argument("--lookback-days", type=int, default=None, help="Override LOOKBACK_DAYS for this run.")
     parser.add_argument("--dump-sample", action="store_true", help="Print one raw Teachworks lesson JSON and exit (for verifying field names).")
+    parser.add_argument("--diagnose-teachworks", action="store_true", help="Read-only: test several /lessons query variants and print status/record counts. Makes zero Monday.com calls and zero writes.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (default INFO).")
     args = parser.parse_args(argv)
 
@@ -246,12 +294,9 @@ def main(argv=None):
         max_retries=config.MAX_RETRIES,
         retry_base_delay=config.RETRY_BASE_DELAY_SECONDS,
     )
-    monday_client = MondayClient(
-        api_token=config.MONDAY_API_TOKEN,
-        timeout=config.REQUEST_TIMEOUT_SECONDS,
-        max_retries=config.MAX_RETRIES,
-        retry_base_delay=config.RETRY_BASE_DELAY_SECONDS,
-    )
+
+    # Monday.com is intentionally not constructed above: --dump-sample and
+    # --diagnose-teachworks never need it, and must not touch it at all.
 
     if args.dump_sample:
         logger.info("Fetching a sample of Teachworks lessons for %s .. %s to inspect raw JSON...", start_date, end_date)
@@ -261,6 +306,16 @@ def main(argv=None):
             return 0
         print(json.dumps(lessons[0], indent=2, default=str))
         return 0
+
+    if args.diagnose_teachworks:
+        return diagnose_teachworks(tw_client, start_date, end_date)
+
+    monday_client = MondayClient(
+        api_token=config.MONDAY_API_TOKEN,
+        timeout=config.REQUEST_TIMEOUT_SECONDS,
+        max_retries=config.MAX_RETRIES,
+        retry_base_delay=config.RETRY_BASE_DELAY_SECONDS,
+    )
 
     mode = "FULL RECONCILIATION" if args.full else "SCHEDULED (rolling lookback)"
     if args.dry_run:

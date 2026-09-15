@@ -102,7 +102,27 @@ pip install -r requirements.txt
 cp .env.example .env   # then fill in TEACHWORKS_API_KEY and MONDAY_API_TOKEN
 ```
 
-## 3. Dry run (no writes — safe to run anytime)
+## 3. Diagnosing a zero-results / wrong-filter Teachworks query
+
+```bash
+python sync.py --diagnose-teachworks --lookback-days 30
+```
+
+Read-only. Fires four `/lessons` request variants directly at Teachworks so
+you can see exactly which query parameter is causing a zero-result (or
+wrong-result) response, without needing to touch or even instantiate
+Monday.com:
+
+1. `page`/`per_page` only — no `status`, no dates.
+2. `from_date`/`to_date` only — no `status`.
+3. `status=Attended` only — no date filters.
+4. The current production query — `status` + `from_date` + `to_date`.
+
+For each variant it prints only the request parameter names/values, the
+HTTP status code, how many records came back, and the first record's raw
+JSON if any — never headers, never the API key/token.
+
+## 4. Dry run (no writes — safe to run anytime)
 
 ```bash
 python sync.py --dry-run
@@ -139,7 +159,7 @@ RESULT: COMPLETED - all sessions synced, but some student connections need atten
 ======================================================================
 ```
 
-## 4. Normal sync (writes to Monday)
+## 5. Normal sync (writes to Monday)
 
 ```bash
 python sync.py
@@ -149,7 +169,7 @@ Checks the last `LOOKBACK_DAYS` days (default 3) and creates any missing
 Session Log items. Safe to run repeatedly — this is what the nightly
 schedule runs.
 
-## 5. Full reconciliation
+## 6. Full reconciliation
 
 ```bash
 python sync.py --full
@@ -195,7 +215,7 @@ real credentials required. They cover:
 
 ---
 
-## 6. Deploying to Railway
+## 7. Deploying to Railway
 
 1. Push this repository to GitHub (see below).
 2. In Railway: **New Project → Deploy from GitHub repo**, select this repo.
@@ -208,7 +228,7 @@ real credentials required. They cover:
 5. Under **Settings → Build**, Railway will run `pip install -r requirements.txt`
    automatically (Nixpacks detects `requirements.txt`).
 
-## 7. Configuring the nightly schedule
+## 8. Configuring the nightly schedule
 
 Railway supports **Cron Schedules** on a service:
 
@@ -225,7 +245,7 @@ Railway supports **Cron Schedules** on a service:
 Do **not** put `--full` in the scheduled command — that's for manual,
 occasional reconciliation only.
 
-## 8. Inspecting logs
+## 9. Inspecting logs
 
 Every run prints a plain-text report (see the dry-run example above) plus
 line-by-line logs for anything notable (`MISSING_STUDENT`, `CREATE_ERROR`,
@@ -240,7 +260,7 @@ tells you at a glance whether the run needs attention:
 A non-developer can read that one line to know whether the night's sync was
 clean.
 
-## 9. Giving / revoking developer access later
+## 10. Giving / revoking developer access later
 
 This integration is just a GitHub repo plus a Railway project — both owned
 by whichever GitHub/Railway account Wright Academics controls.

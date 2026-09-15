@@ -124,6 +124,40 @@ def test_permanent_failure_after_exhausting_retries():
     assert session.get.call_count == 3
 
 
+def test_diagnostic_get_does_not_raise_on_error_status_and_reports_it():
+    session = MagicMock()
+    session.get.side_effect = [_response(404, json_data={"error": "not found"}, text="not found")]
+
+    client = TeachworksClient(api_key="key", base_url="https://api.teachworks.com/v1", session=session)
+    status_code, payload, records = client.diagnostic_get("/lessons", {"page": 1, "per_page": 10})
+
+    assert status_code == 404
+    assert payload == {"error": "not found"}
+    assert records is None
+    assert session.get.call_count == 1  # no retries for diagnostics
+
+
+def test_diagnostic_get_extracts_records_from_bare_list():
+    session = MagicMock()
+    session.get.side_effect = [_response(200, [{"id": 1}, {"id": 2}])]
+
+    client = TeachworksClient(api_key="key", base_url="https://api.teachworks.com/v1", session=session)
+    status_code, payload, records = client.diagnostic_get("/lessons", {"status": "Attended"})
+
+    assert status_code == 200
+    assert records == [{"id": 1}, {"id": 2}]
+
+
+def test_diagnostic_get_extracts_records_from_wrapped_dict():
+    session = MagicMock()
+    session.get.side_effect = [_response(200, {"data": [{"id": 1}]})]
+
+    client = TeachworksClient(api_key="key", base_url="https://api.teachworks.com/v1", session=session)
+    status_code, payload, records = client.diagnostic_get("/lessons", {"status": "Attended"})
+
+    assert records == [{"id": 1}]
+
+
 def test_extract_attended_sessions_only_includes_attended_participants():
     lessons = [
         {
