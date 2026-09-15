@@ -42,35 +42,35 @@ Normal scheduled runs only look back a few days (`LOOKBACK_DAYS`, default
 safe (and useful) to re-check the last few days every night in case
 attendance was entered late or a previous run failed partway through.
 
-## ⚠️ Before you trust real output: verify the Teachworks response mapping
+## ⚠️ Teachworks field mapping: what's confirmed, what isn't
 
 The Teachworks **request** shape (base URL, `/lessons` endpoint, the
-`Authorization: Token token=<key>` header, and the `status`/`from_date`/
-`to_date`/`page`/`per_page` query params) is confirmed against Wright's
-previously-working Zapier implementation — this is known-working, not a
-guess.
+`Authorization: Token token=<key>` header, one `from_date == to_date`
+request per calendar date, and the `status`/`page`/`per_page` params) is
+confirmed against Wright's previously-working Zapier implementation and
+against live production diagnostics.
 
-What's still a **best-effort assumption**, isolated in `teachworks.py`, is
-the shape of each lesson's *response* JSON — how participants are listed
-and the exact field names for tutor/service/location/student:
+The **response** field mapping in `normalize_participant()` is now confirmed
+against a real production lesson/participant (2026-09-13, lesson
+`93279926`): `lesson_id` <- `lesson["id"]`, `session_date` <-
+`lesson["from_date"]`, `tutor` <- `lesson["employee_name"]`, `service` <-
+`lesson["service_name"]`, `location` <- `lesson["location_name"]`,
+`student_id`/`student_name` <- `participant["student_id"]`/`["student_name"]`.
+See `tests/test_teachworks.py::test_normalize_participant_matches_confirmed_2026_09_13_production_response`
+for the exact fixture this was validated against.
 
-- `TeachworksClient._is_attended()` — assumes an `attended: true/false` flag
-  or a `status` string like `"attended"` on each participant.
-- `TeachworksClient.normalize_participant()` — assumes field names like
-  `tutor_name`, `service_name`, `location_name`, `student_name`, `price`,
-  with fallbacks to a few nested alternatives.
-
-**Before running anything against production data**, run:
+**Still unconfirmed:** `duration_minutes` and `amount`. No real response
+we've seen so far (only `from_date`/`from_time` on the lesson) has shown a
+duration or price/amount field — their current lookups are unverified
+guesses. Don't trust the Duration/Amount Monday columns until these are
+confirmed the same way the other fields were, e.g. via:
 
 ```bash
-python sync.py --dump-sample --lookback-days 30
+python sync.py --dump-sample --lookback-days 3
 ```
 
-This authenticates for real and prints one raw Teachworks lesson JSON
-object, with no writes at all. Compare it against `normalize_participant()`
-and `_is_attended()` in `teachworks.py` and adjust the field names if they
-don't match. This is a small, contained fix if needed — everything
-Teachworks-shape-dependent lives in that one file.
+which authenticates for real and prints one raw lesson JSON with no writes
+at all.
 
 ---
 

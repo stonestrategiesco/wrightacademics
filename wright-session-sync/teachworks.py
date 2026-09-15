@@ -6,15 +6,21 @@ names, and the `status=Attended` filter) is confirmed against Wright
 Academics' previously-working Zapier "Code by Zapier" implementation — this
 is a known-working configuration, not a guess.
 
-IMPORTANT — STILL UNVERIFIED:
-The shape of each lesson's *response* JSON (how participants are listed,
-and the exact field names for tutor/service/location/student on that
-response) was not part of the recovered Zapier request and is still a
-best-effort assumption. That logic is isolated in `normalize_participant()`
-and `_is_attended()` so it can be corrected in one place. Run
-`sync.py --dump-sample` against real credentials and compare the printed
-raw lesson JSON against those two methods before trusting non-dry-run
-output.
+Response field mapping in `normalize_participant()` is confirmed against a
+real production lesson/participant pair (2026-09-13, lesson 93279926):
+`lesson_id` <- lesson["id"], `session_date` <- lesson["from_date"],
+`tutor` <- lesson["employee_name"], `service` <- lesson["service_name"],
+`location` <- lesson["location_name"], `student_id`/`student_name` <-
+participant["student_id"]/["student_name"]. See
+test_normalize_participant_matches_confirmed_2026_09_13_production_response
+in tests/test_teachworks.py for the exact fixture.
+
+STILL UNCONFIRMED: `duration_minutes` and `amount` have no confirmed field
+in any real response seen so far (only from_date/from_time are confirmed on
+the lesson; no duration or price/amount field has been observed). Their
+current lookups in `normalize_participant()` are unverified guesses — do
+not trust the Duration/Amount Monday columns until these are confirmed
+against real data the same way the other fields were.
 """
 
 import datetime
@@ -203,10 +209,7 @@ class TeachworksClient:
             participant, "student_name", "name",
             default=(participant.get("student") or {}).get("name") if isinstance(participant.get("student"), dict) else None,
         )
-        tutor = cls._first(
-            lesson, "tutor_name", "instructor_name",
-            default=(lesson.get("tutor") or {}).get("name") if isinstance(lesson.get("tutor"), dict) else None,
-        )
+        tutor = lesson.get("employee_name")
         service = cls._first(
             lesson, "service_name",
             default=(lesson.get("service") or {}).get("name") if isinstance(lesson.get("service"), dict) else None,
@@ -220,7 +223,7 @@ class TeachworksClient:
 
         return {
             "lesson_id": lesson.get("id"),
-            "session_date": cls._first(lesson, "date", "session_date"),
+            "session_date": lesson.get("from_date"),
             "student_id": student_id,
             "student_name": student_name,
             "tutor": tutor,

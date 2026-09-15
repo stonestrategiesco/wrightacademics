@@ -209,6 +209,40 @@ def test_diagnostic_get_extracts_records_from_wrapped_dict():
     assert records == [{"id": 1}]
 
 
+def test_normalize_participant_matches_confirmed_2026_09_13_production_response():
+    """Fixture modeled directly on the real Teachworks response for the
+    2026-09-13 lesson/participant confirmed via production diagnostics."""
+    lesson = {
+        "id": 93279926,
+        "from_date": "2026-09-13",
+        "from_time": "11:00:00",
+        "employee_name": "Monsueir - Young, Mary",
+        "employee_id": 236943,
+        "service_name": "EXECUTIVE FUNCTIONING TUTORING ",
+        "service_id": 115858,
+        "location_name": "*Room A",
+        "status": "Attended",
+    }
+    participant = {
+        "student_name": "Heyne, Jacob",
+        "student_id": 2233786,
+        "status": "Attended",
+        "lesson_id": 93279926,
+    }
+
+    session = TeachworksClient.normalize_participant(lesson, participant)
+
+    assert session["lesson_id"] == 93279926
+    assert session["student_id"] == 2233786
+    assert session["student_name"] == "Heyne, Jacob"
+    assert session["session_date"] == "2026-09-13"
+    assert session["tutor"] == "Monsueir - Young, Mary"
+    assert session["service"] == "EXECUTIVE FUNCTIONING TUTORING "
+    assert session["location"] == "*Room A"
+    assert session["unique_key"] == "93279926_2233786"
+    assert TeachworksClient._is_attended(participant) is True
+
+
 def test_extract_attended_sessions_only_includes_attended_participants():
     lessons = [
         {
