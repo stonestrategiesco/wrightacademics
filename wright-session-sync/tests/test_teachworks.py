@@ -14,6 +14,33 @@ def _response(status_code=200, json_data=None, text=""):
     return resp
 
 
+def test_request_matches_known_working_zapier_shape():
+    """Locks in the request shape recovered from Wright's previously-working
+    Zapier implementation: base URL, /lessons path, Authorization header
+    ('Token token=<key>'), Accept/Content-Type headers, and from_date/to_date/
+    status/page/per_page query params."""
+    session = MagicMock()
+    session.get.side_effect = [_response(200, [{"id": 1}])]
+
+    client = TeachworksClient(api_key="secret-key-123", base_url="https://api.teachworks.com/v1", session=session)
+    client.get_lessons("2026-09-12", "2026-09-15")
+
+    call = session.get.call_args
+    assert call.args[0] == "https://api.teachworks.com/v1/lessons"
+
+    headers = call.kwargs["headers"]
+    assert headers["Authorization"] == "Token token=secret-key-123"
+    assert headers["Accept"] == "application/json"
+    assert headers["Content-Type"] == "application/json"
+
+    params = call.kwargs["params"]
+    assert params["status"] == "Attended"
+    assert params["from_date"] == "2026-09-12"
+    assert params["to_date"] == "2026-09-15"
+    assert params["page"] == 1
+    assert params["per_page"] == 100
+
+
 def test_pagination_retrieves_all_pages():
     session = MagicMock()
     page1 = [{"id": i} for i in range(100)]

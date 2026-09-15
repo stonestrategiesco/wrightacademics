@@ -38,18 +38,20 @@ Normal scheduled runs only look back a few days (`LOOKBACK_DAYS`, default
 safe (and useful) to re-check the last few days every night in case
 attendance was entered late or a previous run failed partway through.
 
-## ⚠️ Before you trust real output: verify the Teachworks field mapping
+## ⚠️ Before you trust real output: verify the Teachworks response mapping
 
-The Teachworks account for Wright Academics was not reachable from the
-environment this was built in (outbound access to teachworks.com is
-blocked there), so the exact JSON field names Teachworks' API returns
-(how it names the tutor, service, location, and — most importantly — how
-it marks a participant "attended") are **best-effort assumptions**, clearly
-isolated in `teachworks.py`:
+The Teachworks **request** shape (base URL, `/lessons` endpoint, the
+`Authorization: Token token=<key>` header, and the `status`/`from_date`/
+`to_date`/`page`/`per_page` query params) is confirmed against Wright's
+previously-working Zapier implementation — this is known-working, not a
+guess.
 
-- `TeachworksClient._auth_headers()` — assumes `Authorization: Bearer <key>`.
+What's still a **best-effort assumption**, isolated in `teachworks.py`, is
+the shape of each lesson's *response* JSON — how participants are listed
+and the exact field names for tutor/service/location/student:
+
 - `TeachworksClient._is_attended()` — assumes an `attended: true/false` flag
-  or a `status` string like `"attended"`.
+  or a `status` string like `"attended"` on each participant.
 - `TeachworksClient.normalize_participant()` — assumes field names like
   `tutor_name`, `service_name`, `location_name`, `student_name`, `price`,
   with fallbacks to a few nested alternatives.

@@ -1,17 +1,20 @@
 """
 Teachworks REST API client.
 
-IMPORTANT — VERIFY BEFORE PRODUCTION USE:
-Wright Academics' Teachworks account was not reachable from the development
-environment this integration was built in, so the exact field names below
-(auth header, pagination shape, lesson/participant JSON keys) are informed
-best-effort assumptions, not confirmed against a live response. Everything
-that depends on Teachworks' response shape is isolated in this file,
-specifically in `_auth_headers()`, `_iter_pages()`, and `normalize_participant()`,
-so it can be corrected in one place. Run `sync.py --dry-run --dump-sample`
-against real credentials first and compare the printed raw lesson JSON
-against the field lookups in `normalize_participant()` before trusting any
-non-dry-run output.
+Request shape (base URL, auth header, /lessons endpoint, query parameter
+names, and the `status=Attended` filter) is confirmed against Wright
+Academics' previously-working Zapier "Code by Zapier" implementation — this
+is a known-working configuration, not a guess.
+
+IMPORTANT — STILL UNVERIFIED:
+The shape of each lesson's *response* JSON (how participants are listed,
+and the exact field names for tutor/service/location/student on that
+response) was not part of the recovered Zapier request and is still a
+best-effort assumption. That logic is isolated in `normalize_participant()`
+and `_is_attended()` so it can be corrected in one place. Run
+`sync.py --dump-sample` against real credentials and compare the printed
+raw lesson JSON against those two methods before trusting non-dry-run
+output.
 """
 
 import logging
@@ -38,11 +41,11 @@ class TeachworksClient:
         self.session = session or requests.Session()
 
     def _auth_headers(self):
-        # ASSUMPTION: Bearer-token auth. Adjust here if Teachworks uses a
-        # different scheme (e.g. a raw API key or Basic auth).
+        # Confirmed against the known-working Zapier implementation.
         return {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Token token={self.api_key}",
             "Accept": "application/json",
+            "Content-Type": "application/json",
         }
 
     def _get(self, path, params=None):
@@ -95,10 +98,15 @@ class TeachworksClient:
                     return payload[key]
         raise TeachworksAPIError(f"Unrecognized Teachworks page response shape: {type(payload)}")
 
-    def get_lessons(self, start_date, end_date, per_page=100):
+    def get_lessons(self, start_date, end_date, status="Attended", per_page=100):
         """Fetch ALL lessons in [start_date, end_date] (inclusive), fully paginated.
 
-        start_date / end_date: 'YYYY-MM-DD' strings.
+        start_date / end_date: 'YYYY-MM-DD' strings, sent as from_date/to_date
+        (matching the known-working Zapier request). `status` defaults to
+        "Attended" since that's what the working implementation filtered on;
+        we still separately check attendance per participant in
+        `_is_attended()`, in case a lesson can contain a mix of attended and
+        non-attended participants even when the lesson-level status matches.
         Never assumes the first page is complete; stops only once a page
         comes back with fewer than `per_page` records.
         """
@@ -108,8 +116,9 @@ class TeachworksClient:
             payload = self._get(
                 "/lessons",
                 params={
-                    "start_date": start_date,
-                    "end_date": end_date,
+                    "status": status,
+                    "from_date": start_date,
+                    "to_date": end_date,
                     "page": page,
                     "per_page": per_page,
                 },
