@@ -22,7 +22,11 @@ schedule.
    full duplicate-prevention index).
 2. Loads every Monday Student that has a Teachworks Student ID, into a
    `Teachworks Student ID -> Monday Item ID` lookup.
-3. Fetches Teachworks lessons in a date range (fully paginated).
+3. Fetches Teachworks lessons in a date range. Confirmed via production
+   diagnostics that a single multi-day `from_date`/`to_date` request
+   returns **zero** records even when matching data exists, so this issues
+   one `from_date == to_date` request **per calendar date** in the range
+   instead, each fully paginated independently, and combines the results.
 4. For every **attended** participant on every lesson, builds the key
    `{teachworks_lesson_id}_{teachworks_student_id}`.
    - If that key already exists on the board → skip.
@@ -193,9 +197,15 @@ python sync.py --full
 Scans from `FULL_SYNC_START_DATE` through today and reconciles against
 every existing Monday Session Log item. Still fully idempotent — it will
 not duplicate anything already on the board. This is comparatively slow
-and API-heavy; **do not schedule it nightly**. Run it manually when you
-suspect the board has drifted from Teachworks (e.g. after the old Zapier
-automation was still partially active, or after a long outage).
+and API-heavy — since Teachworks requires one request per calendar date
+(see "How it works" above), a multi-year `--full` run means one HTTP
+request (or more, if a single day paginates) per day in that range, so a
+default `FULL_SYNC_START_DATE` of `2020-01-01` means thousands of requests.
+Set `FULL_SYNC_START_DATE` to the actual start of Wright's usable Teachworks
+data before running this, and **do not schedule it nightly**. Run it
+manually when you suspect the board has drifted from Teachworks (e.g. after
+the old Zapier automation was still partially active, or after a long
+outage).
 
 Combine with `--dry-run` first to see the full scope before writing:
 

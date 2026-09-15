@@ -17,6 +17,7 @@ raw lesson JSON against those two methods before trusting non-dry-run
 output.
 """
 
+import datetime
 import logging
 import time
 
@@ -122,18 +123,17 @@ class TeachworksClient:
                     return payload[key]
         raise TeachworksAPIError(f"Unrecognized Teachworks page response shape: {type(payload)}")
 
-    def get_lessons(self, start_date, end_date, status="Attended", per_page=100):
-        """Fetch ALL lessons in [start_date, end_date] (inclusive), fully paginated.
+    @staticmethod
+    def _iter_calendar_dates(start_date, end_date):
+        """Yield every 'YYYY-MM-DD' date from start_date through end_date, inclusive."""
+        current = datetime.date.fromisoformat(start_date)
+        end = datetime.date.fromisoformat(end_date)
+        while current <= end:
+            yield current.isoformat()
+            current += datetime.timedelta(days=1)
 
-        start_date / end_date: 'YYYY-MM-DD' strings, sent as from_date/to_date
-        (matching the known-working Zapier request). `status` defaults to
-        "Attended" since that's what the working implementation filtered on;
-        we still separately check attendance per participant in
-        `_is_attended()`, in case a lesson can contain a mix of attended and
-        non-attended participants even when the lesson-level status matches.
-        Never assumes the first page is complete; stops only once a page
-        comes back with fewer than `per_page` records.
-        """
+    def _get_lessons_for_one_date(self, date_str, status, per_page):
+        """Fully paginate a SINGLE day's /lessons (from_date == to_date == date_str)."""
         lessons = []
         page = 1
         while True:
@@ -141,18 +141,37 @@ class TeachworksClient:
                 "/lessons",
                 params={
                     "status": status,
-                    "from_date": start_date,
-                    "to_date": end_date,
+                    "from_date": date_str,
+                    "to_date": date_str,
                     "page": page,
                     "per_page": per_page,
                 },
             )
             page_records = self._extract_page(payload)
             lessons.extend(page_records)
-            logger.debug("Fetched Teachworks lessons page %d (%d records)", page, len(page_records))
+            logger.debug("Fetched Teachworks lessons for %s page %d (%d records)", date_str, page, len(page_records))
             if len(page_records) < per_page:
                 break
             page += 1
+        return lessons
+
+    def get_lessons(self, start_date, end_date, status="Attended", per_page=100):
+        """Fetch ALL lessons in [start_date, end_date] (inclusive).
+
+        Confirmed via production diagnostics: a single request spanning a
+        multi-day from_date/to_date range returns zero records, even though
+        the exact same status/from_date/to_date parameters return correct
+        results for a single day. So instead of one multi-day range request,
+        this issues one from_date == to_date request PER CALENDAR DATE in
+        the range, each fully paginated independently, and combines the
+        results. An empty day does not stop later dates from being checked.
+        Deduplication across dates (if the same lesson were ever returned by
+        more than one day's query) is handled downstream by the unique-key
+        check in sync.run_sync, not here.
+        """
+        lessons = []
+        for date_str in self._iter_calendar_dates(start_date, end_date):
+            lessons.extend(self._get_lessons_for_one_date(date_str, status=status, per_page=per_page))
         return lessons
 
     @staticmethod

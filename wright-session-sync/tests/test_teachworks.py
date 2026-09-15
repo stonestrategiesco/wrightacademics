@@ -18,12 +18,13 @@ def test_request_matches_known_working_zapier_shape():
     """Locks in the request shape recovered from Wright's previously-working
     Zapier implementation: base URL, /lessons path, Authorization header
     ('Token token=<key>'), Accept/Content-Type headers, and from_date/to_date/
-    status/page/per_page query params."""
+    status/page/per_page query params. Single-day range: from_date == to_date,
+    confirmed via production diagnostics to be the only shape that works."""
     session = MagicMock()
     session.get.side_effect = [_response(200, [{"id": 1}])]
 
     client = TeachworksClient(api_key="secret-key-123", base_url="https://api.teachworks.com/v1", session=session)
-    client.get_lessons("2026-09-12", "2026-09-15")
+    client.get_lessons("2026-09-12", "2026-09-12")
 
     call = session.get.call_args
     assert call.args[0] == "https://api.teachworks.com/v1/lessons"
@@ -36,40 +37,90 @@ def test_request_matches_known_working_zapier_shape():
     params = call.kwargs["params"]
     assert params["status"] == "Attended"
     assert params["from_date"] == "2026-09-12"
-    assert params["to_date"] == "2026-09-15"
+    assert params["to_date"] == "2026-09-12"
     assert params["page"] == 1
     assert params["per_page"] == 100
 
 
-def test_pagination_retrieves_all_pages():
+def test_single_day_range_makes_exactly_one_request():
+    """A single-day range (start_date == end_date) still works as a simple,
+    one-request case."""
     session = MagicMock()
-    page1 = [{"id": i} for i in range(100)]
-    page2 = [{"id": i} for i in range(100, 150)]
-    session.get.side_effect = [
-        _response(200, page1),
-        _response(200, page2),
-    ]
-
-    client = TeachworksClient(api_key="key", base_url="https://example.com", session=session, max_retries=3)
-    lessons = client.get_lessons("2026-01-01", "2026-01-31", per_page=100)
-
-    assert len(lessons) == 150
-    assert session.get.call_count == 2
-    first_call_params = session.get.call_args_list[0].kwargs["params"]
-    second_call_params = session.get.call_args_list[1].kwargs["params"]
-    assert first_call_params["page"] == 1
-    assert second_call_params["page"] == 2
-
-
-def test_pagination_stops_on_short_final_page_even_if_only_one_page():
-    session = MagicMock()
-    session.get.side_effect = [_response(200, [{"id": 1}])]
+    session.get.side_effect = [_response(200, [{"id": 1}, {"id": 2}])]
 
     client = TeachworksClient(api_key="key", base_url="https://example.com", session=session)
-    lessons = client.get_lessons("2026-01-01", "2026-01-31", per_page=100)
+    lessons = client.get_lessons("2026-09-13", "2026-09-13", per_page=100)
 
-    assert len(lessons) == 1
     assert session.get.call_count == 1
+    assert len(lessons) == 2
+    params = session.get.call_args.kwargs["params"]
+    assert params["from_date"] == "2026-09-13"
+    assert params["to_date"] == "2026-09-13"
+
+
+def test_multi_day_range_makes_one_request_per_calendar_date():
+    """Confirmed via production diagnostics that a single multi-day from_date/
+    to_date request returns zero records even when the real data exists, so
+    get_lessons must issue one request PER DATE instead. A 3-day range must
+    make exactly 3 requests, each with from_date == to_date == that date."""
+    session = MagicMock()
+    session.get.side_effect = [
+        _response(200, [{"id": 1}]),
+        _response(200, [{"id": 2}]),
+        _response(200, [{"id": 3}]),
+    ]
+
+    client = TeachworksClient(api_key="key", base_url="https://example.com", session=session)
+    lessons = client.get_lessons("2026-09-13", "2026-09-15", per_page=100)
+
+    assert session.get.call_count == 3
+    expected_dates = ["2026-09-13", "2026-09-14", "2026-09-15"]
+    for call, expected_date in zip(session.get.call_args_list, expected_dates):
+        params = call.kwargs["params"]
+        assert params["from_date"] == expected_date
+        assert params["to_date"] == expected_date  # identical from_date/to_date on every request
+
+    assert [lesson["id"] for lesson in lessons] == [1, 2, 3]  # all dates' lessons combined
+
+
+def test_each_date_paginates_independently():
+    """Day 1 has two pages of results, day 2 has one short page. Pagination
+    must reset to page 1 for each new date, and each date's page count must
+    not affect the others."""
+    session = MagicMock()
+    day1_page1 = [{"id": i} for i in range(2)]   # full page (per_page=2) -> continue
+    day1_page2 = [{"id": 99}]                     # short page -> day 1 done
+    day2_page1 = [{"id": 100}]                     # short page -> day 2 done
+    session.get.side_effect = [
+        _response(200, day1_page1),
+        _response(200, day1_page2),
+        _response(200, day2_page1),
+    ]
+
+    client = TeachworksClient(api_key="key", base_url="https://example.com", session=session)
+    lessons = client.get_lessons("2026-09-13", "2026-09-14", per_page=2)
+
+    assert session.get.call_count == 3
+    calls = session.get.call_args_list
+    assert calls[0].kwargs["params"]["from_date"] == "2026-09-13" and calls[0].kwargs["params"]["page"] == 1
+    assert calls[1].kwargs["params"]["from_date"] == "2026-09-13" and calls[1].kwargs["params"]["page"] == 2
+    assert calls[2].kwargs["params"]["from_date"] == "2026-09-14" and calls[2].kwargs["params"]["page"] == 1
+    # all lessons across both dates and both of day 1's pages are combined
+    assert [lesson["id"] for lesson in lessons] == [0, 1, 99, 100]
+
+
+def test_empty_day_does_not_stop_subsequent_dates():
+    session = MagicMock()
+    session.get.side_effect = [
+        _response(200, []),              # 2026-09-13: nothing attended that day
+        _response(200, [{"id": 42}]),    # 2026-09-14: one lesson
+    ]
+
+    client = TeachworksClient(api_key="key", base_url="https://example.com", session=session)
+    lessons = client.get_lessons("2026-09-13", "2026-09-14", per_page=100)
+
+    assert session.get.call_count == 2
+    assert lessons == [{"id": 42}]
 
 
 def test_transient_failure_retries_then_succeeds():
@@ -81,7 +132,7 @@ def test_transient_failure_retries_then_succeeds():
 
     client = TeachworksClient(api_key="key", base_url="https://example.com", session=session, max_retries=3, retry_base_delay=0)
     with patch("teachworks.time.sleep"):
-        lessons = client.get_lessons("2026-01-01", "2026-01-31", per_page=100)
+        lessons = client.get_lessons("2026-01-01", "2026-01-01", per_page=100)
 
     assert lessons == [{"id": 1}]
     assert session.get.call_count == 2
@@ -96,7 +147,7 @@ def test_transient_network_error_retries_then_succeeds():
 
     client = TeachworksClient(api_key="key", base_url="https://example.com", session=session, max_retries=3, retry_base_delay=0)
     with patch("teachworks.time.sleep"):
-        lessons = client.get_lessons("2026-01-01", "2026-01-31", per_page=100)
+        lessons = client.get_lessons("2026-01-01", "2026-01-01", per_page=100)
 
     assert lessons == [{"id": 1}]
 
@@ -107,7 +158,7 @@ def test_permanent_failure_is_surfaced_without_exhausting_retries():
 
     client = TeachworksClient(api_key="bad-key", base_url="https://example.com", session=session, max_retries=5, retry_base_delay=0)
     with pytest.raises(TeachworksAPIError):
-        client.get_lessons("2026-01-01", "2026-01-31")
+        client.get_lessons("2026-01-01", "2026-01-01")
 
     assert session.get.call_count == 1
 
@@ -119,7 +170,7 @@ def test_permanent_failure_after_exhausting_retries():
     client = TeachworksClient(api_key="key", base_url="https://example.com", session=session, max_retries=3, retry_base_delay=0)
     with patch("teachworks.time.sleep"):
         with pytest.raises(TeachworksAPIError):
-            client.get_lessons("2026-01-01", "2026-01-31")
+            client.get_lessons("2026-01-01", "2026-01-01")
 
     assert session.get.call_count == 3
 
