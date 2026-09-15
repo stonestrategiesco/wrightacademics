@@ -30,14 +30,26 @@ def test_diagnose_teachworks_makes_zero_monday_calls(monkeypatch, capsys):
     exit_code = sync.main(["--diagnose-teachworks", "--lookback-days", "5"])
 
     assert exit_code == 0
-    # Four request variants, exactly as specified: bare pagination, dates-only,
-    # status-only, and the full production query.
-    assert len(fake_tw.calls) == 4
+    # Eight request variants: the original 4 (bare pagination, dates-only,
+    # status-only, full production query) plus 4 added to isolate the
+    # from_date/to_date behavior specifically (from_date only, to_date only,
+    # a known-good single day, and that known-good day + status).
+    assert len(fake_tw.calls) == 8
     variant_params = [params for _, params in fake_tw.calls]
+
     assert variant_params[0] == {"page": 1, "per_page": 10}
-    assert "status" not in variant_params[1] and "from_date" in variant_params[1]
+    assert "status" not in variant_params[1] and "from_date" in variant_params[1] and "to_date" in variant_params[1]
     assert "from_date" not in variant_params[2] and variant_params[2]["status"] == "Attended"
     assert variant_params[3]["status"] == "Attended" and "from_date" in variant_params[3]
+
+    assert "to_date" not in variant_params[4] and "from_date" in variant_params[4] and "status" not in variant_params[4]
+    assert "from_date" not in variant_params[5] and "to_date" in variant_params[5] and "status" not in variant_params[5]
+
+    assert variant_params[6] == {"from_date": sync.KNOWN_GOOD_HISTORICAL_DATE, "to_date": sync.KNOWN_GOOD_HISTORICAL_DATE, "page": 1, "per_page": 10}
+    assert variant_params[7] == {
+        "status": "Attended", "from_date": sync.KNOWN_GOOD_HISTORICAL_DATE, "to_date": sync.KNOWN_GOOD_HISTORICAL_DATE,
+        "page": 1, "per_page": 10,
+    }
 
 
 def test_diagnose_teachworks_never_prints_credentials(monkeypatch, capsys):

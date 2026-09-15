@@ -27,6 +27,11 @@ from teachworks import TeachworksClient
 
 logger = logging.getLogger("wright_sync")
 
+# A lesson date confirmed (via --diagnose-teachworks against the real API) to
+# have at least one Attended record, used as a known-good fixture when
+# isolating date-filter behavior.
+KNOWN_GOOD_HISTORICAL_DATE = "2017-07-18"
+
 
 @dataclass
 class SyncReport:
@@ -163,10 +168,19 @@ def diagnose_teachworks(tw_client, start_date, end_date):
     Makes zero Monday.com calls and zero writes of any kind."""
     variants = [
         ("1. page/per_page only (no status, no dates)", {"page": 1, "per_page": 10}),
-        ("2. from_date/to_date only (no status)", {"from_date": start_date, "to_date": end_date, "page": 1, "per_page": 10}),
+        ("2. from_date/to_date together, no status", {"from_date": start_date, "to_date": end_date, "page": 1, "per_page": 10}),
         ("3. status=Attended only (no date filters)", {"status": "Attended", "page": 1, "per_page": 10}),
         ("4. current production query (status + from_date + to_date)", {
             "status": "Attended", "from_date": start_date, "to_date": end_date, "page": 1, "per_page": 10,
+        }),
+        ("5. from_date only (no to_date, no status)", {"from_date": start_date, "page": 1, "per_page": 10}),
+        ("6. to_date only (no from_date, no status)", {"to_date": end_date, "page": 1, "per_page": 10}),
+        (f"7. known-good single day {KNOWN_GOOD_HISTORICAL_DATE} (from_date=to_date, no status)", {
+            "from_date": KNOWN_GOOD_HISTORICAL_DATE, "to_date": KNOWN_GOOD_HISTORICAL_DATE, "page": 1, "per_page": 10,
+        }),
+        (f"8. known-good single day {KNOWN_GOOD_HISTORICAL_DATE} + status=Attended", {
+            "status": "Attended", "from_date": KNOWN_GOOD_HISTORICAL_DATE, "to_date": KNOWN_GOOD_HISTORICAL_DATE,
+            "page": 1, "per_page": 10,
         }),
     ]
 
