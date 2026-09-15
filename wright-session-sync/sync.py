@@ -299,7 +299,8 @@ def diagnose_teachworks_pagination(tw_client, status="Attended", per_page=100, m
 
 # Columns read for the dedup diagnostic: the production unique-ID column
 # plus secondary fields (NEVER used for production deduplication decisions -
-# the unique key is the only production key).
+# the unique key, and the legacy bare-lesson-ID fallback, are the only
+# production keys - see run_sync()).
 _DEDUP_DIAGNOSTIC_COLUMNS = [
     config.COL_UNIQUE_ID,
     config.COL_SESSION_DATE,
@@ -310,24 +311,56 @@ _DEDUP_DIAGNOSTIC_COLUMNS = [
 ]
 
 
-def _find_likely_secondary_matches(session, monday_items, limit=5):
-    """Best-effort, READ-ONLY secondary match on session date + Teachworks
-    student ID (falling back to date + tutor/service). Diagnostic only -
-    never used to decide production deduplication."""
-    matches = []
+def _classify_session(session, existing_unique_keys):
+    """Compute the same composite/legacy keys run_sync() uses, and report
+    which (if either) is already present in Monday's unique-ID column."""
+    lesson_id = session.get("lesson_id")
+    composite_key = session["unique_key"]
+    legacy_key = str(lesson_id) if lesson_id is not None else None
+
+    composite_exists = composite_key in existing_unique_keys
+    legacy_exists = legacy_key is not None and legacy_key in existing_unique_keys
+
+    return {
+        "session": session,
+        "composite_key": composite_key,
+        "legacy_key": legacy_key,
+        "composite_exists": composite_exists,
+        "legacy_exists": legacy_exists,
+        "matched": composite_exists or legacy_exists,
+    }
+
+
+def _find_likely_historical_matches(session, monday_items, limit=5):
+    """Best-effort, READ-ONLY search for a historical Monday record that
+    might represent this unmatched session under a different key format.
+    Diagnostic only - NEVER used to decide production deduplication.
+
+    Criteria (any one qualifies a candidate):
+      A. exact session date + exact Teachworks Student ID
+      B. exact session date + student name, when the Monday item's own
+         Teachworks Student ID column is blank
+      C. the Teachworks lesson ID appears in the Monday item's own name
+    """
     session_date = session.get("session_date")
     student_id_str = str(session.get("student_id")) if session.get("student_id") is not None else None
+    student_name = session.get("student_name")
+    lesson_id_str = str(session.get("lesson_id")) if session.get("lesson_id") is not None else None
 
+    matches = []
     for item in monday_items:
         cols = item["columns"]
-        if session_date and cols.get(config.COL_SESSION_DATE) != session_date:
-            continue
-        same_student = bool(student_id_str) and cols.get(config.COL_TEACHWORKS_STUDENT_ID) == student_id_str
-        same_tutor_or_service = (
-            (session.get("tutor") and cols.get(config.COL_TUTOR) == session.get("tutor"))
-            or (session.get("service") and cols.get(config.COL_SERVICE) == session.get("service"))
+        monday_student_id = cols.get(config.COL_TEACHWORKS_STUDENT_ID)
+        same_date = bool(session_date) and cols.get(config.COL_SESSION_DATE) == session_date
+
+        criterion_a = same_date and student_id_str and monday_student_id == student_id_str
+        criterion_b = (
+            same_date and not monday_student_id
+            and student_name and cols.get(config.COL_STUDENT_NAME) == student_name
         )
-        if same_student or same_tutor_or_service:
+        criterion_c = bool(lesson_id_str) and lesson_id_str in (item.get("item_name") or "")
+
+        if criterion_a or criterion_b or criterion_c:
             matches.append(item)
         if len(matches) >= limit:
             break
@@ -335,16 +368,16 @@ def _find_likely_secondary_matches(session, monday_items, limit=5):
 
 
 def diagnose_dedup(tw_client, monday_client, start_date, end_date):
-    """Read-only: investigates why production deduplication saw zero exact
-    unique-key matches despite thousands of existing Monday Session Log
-    records. Computes the unique key for every Teachworks participant
-    session in the range exactly as production does, compares it against
-    what's actually stored in Monday's unique-ID column, and — for
-    unmatched sessions only — attempts a READ-ONLY secondary-field
-    comparison (session date, Teachworks student ID, tutor, service) purely
-    to investigate whether the old process used a different key format.
-    Secondary fields are never used to decide production deduplication.
-    Makes ZERO Monday writes."""
+    """Read-only: for EVERY Teachworks participant session in range, reports
+    whether it matches an existing Monday unique-ID value (composite or
+    legacy bare-lesson-ID), exactly as run_sync() would decide. For sessions
+    with no match, attempts a READ-ONLY, diagnostic-only search for a likely
+    historical Monday record under a different key format. Never used to
+    decide production deduplication, and makes ZERO Monday writes.
+
+    Output is grouped into clearly separated, deterministically-ordered
+    sections (per-session rows, then secondary investigation, then summary)
+    rather than interleaved."""
     print("=" * 70)
     print("DEDUPLICATION DIAGNOSTIC (read-only, zero Monday writes)")
     print(f"Date range: {start_date} .. {end_date}")
@@ -354,53 +387,81 @@ def diagnose_dedup(tw_client, monday_client, start_date, end_date):
     sessions = tw_client.extract_attended_sessions(lessons)
 
     monday_items = monday_client.get_items(config.MONDAY_SESSIONS_BOARD_ID, _DEDUP_DIAGNOSTIC_COLUMNS)
-
     existing_unique_keys = {
-        item["columns"].get(config.COL_UNIQUE_ID)
-        for item in monday_items
-        if item["columns"].get(config.COL_UNIQUE_ID)
+        item["columns"].get(config.COL_UNIQUE_ID) for item in monday_items if item["columns"].get(config.COL_UNIQUE_ID)
     }
 
-    exact_matches = 0
-    unmatched_sessions = []
-    for session in sessions:
-        if session["unique_key"] in existing_unique_keys:
-            exact_matches += 1
-        else:
-            unmatched_sessions.append(session)
-
-    print(f"Teachworks participant sessions: {len(sessions)}")
-    print(f"Exact unique-key matches: {exact_matches}")
-    print(f"No unique-key match: {len(unmatched_sessions)}")
+    rows = [_classify_session(session, existing_unique_keys) for session in sessions]
+    # Deterministic order: by lesson ID then student ID, not fetch order.
+    rows.sort(key=lambda r: (
+        r["session"].get("lesson_id") if r["session"].get("lesson_id") is not None else -1,
+        r["session"].get("student_id") if r["session"].get("student_id") is not None else -1,
+    ))
 
     print("\n" + "-" * 70)
-    print(f"READ-ONLY secondary-field comparison for the first 10 of {len(unmatched_sessions)} unmatched sessions")
-    print("(diagnostic only - NEVER used for production deduplication):")
+    print(f"PER-SESSION DIAGNOSTIC ROWS ({len(rows)} total, sorted by lesson ID then student ID)")
+    print("-" * 70)
+    for row in rows:
+        session = row["session"]
+        print(
+            f"date={session.get('session_date')} lesson_id={session.get('lesson_id')} "
+            f"student_id={session.get('student_id')} student_name={session.get('student_name')} "
+            f"composite_key={row['composite_key']} composite_exists={row['composite_exists']} "
+            f"legacy_exists={row['legacy_exists']} => {'MATCHED' if row['matched'] else 'UNMATCHED'}"
+        )
+
+    unmatched_rows = [r for r in rows if not r["matched"]]
+
+    print("\n" + "-" * 70)
+    print(f"SECONDARY INVESTIGATION for {len(unmatched_rows)} unmatched session(s) - DIAGNOSTIC ONLY")
+    print("NEVER used for production deduplication.")
     print("-" * 70)
 
-    for session in unmatched_sessions[:10]:
-        print(f"\nTeachworks lesson ID: {session['lesson_id']}")
-        print(f"Teachworks student ID: {session['student_id']}")
-        print(f"Expected new unique key: {session['unique_key']}")
+    unmatched_with_likely_match = 0
+    for row in unmatched_rows:
+        session = row["session"]
+        print(
+            f"\nUnmatched: lesson_id={session.get('lesson_id')} student_id={session.get('student_id')} "
+            f"student_name={session.get('student_name')} date={session.get('session_date')} "
+            f"expected_composite_key={row['composite_key']}"
+        )
 
-        likely_matches = _find_likely_secondary_matches(session, monday_items)
+        likely_matches = _find_likely_historical_matches(session, monday_items)
         if not likely_matches:
-            print("  No likely match found on session date + student ID/tutor/service.")
+            print("  No likely historical Monday record found.")
             continue
+
+        unmatched_with_likely_match += 1
         for match in likely_matches:
             cols = match["columns"]
-            print(f"  Existing Monday item ID: {match['item_id']}")
-            print(f"  Existing Monday unique-ID value: {cols.get(config.COL_UNIQUE_ID) or '(blank)'}")
-            print(f"  Session date: {cols.get(config.COL_SESSION_DATE) or '(blank)'}")
+            print(f"  Monday item ID: {match['item_id']}")
+            print(f"  Monday item name: {match.get('item_name') or '(blank)'}")
+            print(f"  Monday session date: {cols.get(config.COL_SESSION_DATE) or '(blank)'}")
+            print(f"  Monday Teachworks Student ID: {cols.get(config.COL_TEACHWORKS_STUDENT_ID) or '(blank)'}")
+            print(f"  Monday {config.COL_UNIQUE_ID} value: {cols.get(config.COL_UNIQUE_ID) or '(blank)'}")
+            print(f"  Tutor: {cols.get(config.COL_TUTOR) or '(blank)'}")
+            print(f"  Service: {cols.get(config.COL_SERVICE) or '(blank)'}")
 
-    print("\n" + "-" * 70)
-    print(f"Sample of up to 10 nonblank existing {config.COL_UNIQUE_ID} values on the board:")
-    sample = [v for v in existing_unique_keys if v][:10]
-    if sample:
-        for value in sample:
-            print(f"  {value}")
-    else:
-        print("  (no nonblank values found on the board)")
+    composite_matches = sum(1 for r in rows if r["composite_exists"])
+    legacy_only_matches = sum(1 for r in rows if r["legacy_exists"] and not r["composite_exists"])
+    total_exact_matches = sum(1 for r in rows if r["matched"])
+    unmatched_no_likely = len(unmatched_rows) - unmatched_with_likely_match
+
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"Teachworks participant sessions: {len(rows)}")
+    print(f"Composite-key matches: {composite_matches}")
+    print(f"Legacy-key matches: {legacy_only_matches}")
+    print(f"Total exact matches: {total_exact_matches}")
+    print(f"Unmatched sessions: {len(unmatched_rows)}")
+    print(f"Unmatched with likely date+student historical Monday record: {unmatched_with_likely_match}")
+    print(f"Unmatched with no likely historical Monday record: {unmatched_no_likely}")
+
+    unmatched_lesson_ids = sorted(
+        {r["session"].get("lesson_id") for r in unmatched_rows if r["session"].get("lesson_id") is not None}
+    )
+    print(f"\nUnmatched Teachworks lesson IDs: {unmatched_lesson_ids}")
 
     print("\n" + "=" * 70)
     print("DIAGNOSTIC COMPLETE - read-only. Zero Monday writes were made.")

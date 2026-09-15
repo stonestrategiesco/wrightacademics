@@ -156,31 +156,35 @@ python sync.py --diagnose-dedup --lookback-days 2
 
 Read-only — makes **zero Monday writes**, though unlike the two diagnostics
 above it does read from Monday.com (it needs to see the existing unique-ID
-column). Use this if a dry run or real sync reports far fewer duplicate
-skips than you'd expect given how many Session Log records already exist.
+column and a few others). Use this if a dry run or real sync reports fewer
+duplicate skips than expected given how many Session Log records already
+exist.
 
-It computes the unique key for every Teachworks participant session in the
-range exactly as production does, compares it against every non-blank value
-actually stored in Monday's `text_mm5h9n9g` column, and reports:
+For **every** Teachworks participant session in range, it prints one row
+with the session date, lesson ID, student ID/name, the composite key
+production would compute, whether that composite key and/or the legacy
+bare-lesson-ID exist in Monday's `text_mm5h9n9g` column, and a final
+MATCHED/UNMATCHED verdict — computed exactly the way `run_sync()` decides
+it, sorted deterministically by lesson ID then student ID.
 
-```
-Teachworks participant sessions: <n>
-Exact unique-key matches: <n>
-No unique-key match: <n>
-```
+For every **unmatched** session, it then does a **read-only,
+diagnostic-only** search for a likely historical Monday record under a
+different key format, using: (A) exact session date + exact Teachworks
+Student ID, (B) exact session date + student name when the Monday record's
+own Student ID column is blank, or (C) the lesson ID appearing in the
+Monday item's own name. Any match prints the Monday item ID, item name,
+session date, Teachworks Student ID, stored unique-ID value, tutor, and
+service.
 
-For the first 10 sessions with no exact match, it attempts a **read-only,
-diagnostic-only** secondary comparison against existing Monday records using
-session date + Teachworks Student ID (falling back to tutor/service), and
-prints any likely match's Monday item ID, its stored unique-ID value, and
-its session date — so you can see whether the old Zap stored a different
-key format, stored no key at all, or whether these are genuinely new
-sessions it never created. It also prints a sample of up to 10 non-blank
-existing unique-ID values so you can see their actual format.
+It ends with a summary (participant sessions, composite-key matches,
+legacy-key matches, total exact matches, unmatched counts split by whether
+a likely historical record was found) and the full list of unmatched
+Teachworks lesson IDs.
 
-These secondary fields are **never** used to decide production
-deduplication — only the exact unique-key match is. This diagnostic exists
-purely to investigate, not to change, dedup behavior.
+These secondary fields (A/B/C above) are **never** used to decide
+production deduplication — only the exact composite/legacy key match run
+by `run_sync()` is. This diagnostic exists purely to investigate, not to
+change, dedup behavior.
 
 ## 5. Dry run (no writes — safe to run anytime)
 

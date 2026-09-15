@@ -20,7 +20,7 @@ class FakeMondayClient:
     def __init__(self, existing_ids=None, student_lookup=None, items=None):
         self.existing_ids = set(existing_ids or [])
         self.student_lookup = dict(student_lookup or {})
-        # items: list of {"item_id": ..., "columns": {col_id: text}}, used by get_items()
+        # items: list of {"item_id": ..., "item_name": ..., "columns": {col_id: text}}, used by get_items()
         self.items = list(items or [])
         self.created_items = []
         self.connections = []
@@ -59,7 +59,11 @@ class FakeMondayClient:
 
     def get_items(self, board_id, column_ids):
         return [
-            {"item_id": item["item_id"], "columns": {col: item["columns"].get(col, "") for col in column_ids}}
+            {
+                "item_id": item["item_id"],
+                "item_name": item.get("item_name", ""),
+                "columns": {col: item["columns"].get(col, "") for col in column_ids},
+            }
             for item in self.items
         ]
 

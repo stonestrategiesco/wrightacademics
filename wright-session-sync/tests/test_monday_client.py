@@ -71,8 +71,8 @@ def test_get_items_returns_multiple_columns_per_item_and_paginates():
 
     assert session.post.call_count == 2
     assert items == [
-        {"item_id": "1", "columns": {"uid": "111_1", "date": "2026-09-13"}},
-        {"item_id": "2", "columns": {"uid": "", "date": "2026-09-14"}},
+        {"item_id": "1", "item_name": "a", "columns": {"uid": "111_1", "date": "2026-09-13"}},
+        {"item_id": "2", "item_name": "b", "columns": {"uid": "", "date": "2026-09-14"}},
     ]
 
 
