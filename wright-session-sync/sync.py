@@ -522,6 +522,150 @@ def diagnose_student_columns(monday_client):
     return 0
 
 
+# Columns read from the Session Log board to compute rollups. Deliberately
+# NOT a fresh Teachworks crawl: every Session Log row already IS a
+# Teachworks attended participant session, ingested by the locked,
+# field-verified sync. Re-deriving rollups from years of one-day Teachworks
+# queries would risk thousands of requests; this reads the board Monday
+# already has, the same way get_existing_unique_ids/get_items do on every
+# sync run today.
+_SESSION_LOG_ROLLUP_SOURCE_COLUMNS = [
+    config.COL_TEACHWORKS_STUDENT_ID,
+    config.COL_SESSION_DATE,
+    config.COL_TUTOR,
+]
+
+_STUDENT_ROLLUP_TARGET_COLUMNS = [
+    config.STUDENT_BOARD_COL_TEACHWORKS_ID,
+    config.STUDENT_COL_FIRST_SESSION_DATE,
+    config.STUDENT_COL_SESSION_COUNT,
+    config.STUDENT_COL_LAST_SESSION_DATE,
+    config.STUDENT_COL_TUTOR,
+    config.STUDENT_COL_SESSION_DATA_LAST_SYNCED,
+]
+
+
+def _aggregate_session_log_by_student(session_log_items):
+    """Group Session Log rows by Teachworks Student ID and compute the
+    lifetime rollup fields for each. Rows with no Teachworks Student ID or
+    no session date are skipped (can't be attributed to a student or
+    ordered). "Latest tutor" is the tutor on the row with the latest
+    session date, breaking ties by item ID for determinism."""
+    rows_by_student = {}
+    for item in session_log_items:
+        cols = item["columns"]
+        tw_id = cols.get(config.COL_TEACHWORKS_STUDENT_ID)
+        session_date = cols.get(config.COL_SESSION_DATE)
+        if not tw_id or not session_date:
+            continue
+        tutor = cols.get(config.COL_TUTOR)
+        rows_by_student.setdefault(tw_id, []).append((session_date, item["item_id"], tutor))
+
+    rollups = {}
+    for tw_id, rows in rows_by_student.items():
+        rows.sort(key=lambda row: (row[0], row[1]))
+        rollups[tw_id] = {
+            "teachworks_student_id": tw_id,
+            "first_session_date": rows[0][0],
+            "last_session_date": rows[-1][0],
+            "session_count": len(rows),
+            "latest_tutor": rows[-1][2],
+        }
+    return rollups
+
+
+def diagnose_student_rollups(monday_client, today=None):
+    """Stage 1, read-only: calculates lifetime student rollups from the
+    Monday Session Log board (see the module note above for why this - not
+    a live Teachworks crawl), matches to Monday Students strictly by
+    Teachworks Student ID (never by name), and reports CURRENT -> CALCULATED
+    for each of the five target fields plus a MATCH / WOULD UPDATE / MISSING
+    MONDAY STUDENT verdict per student. Makes ZERO Monday writes and issues
+    ZERO Teachworks requests."""
+    today = today or datetime.date.today().isoformat()
+
+    print("=" * 70)
+    print("STUDENT ROLLUP DIAGNOSTIC (read-only, zero Monday writes)")
+    print("Calculated from the Monday Session Log board - see sync.py for why.")
+    print("=" * 70)
+
+    session_log_items = monday_client.get_items(config.MONDAY_SESSIONS_BOARD_ID, _SESSION_LOG_ROLLUP_SOURCE_COLUMNS)
+    rollups = _aggregate_session_log_by_student(session_log_items)
+
+    student_items = monday_client.get_items(config.MONDAY_STUDENTS_BOARD_ID, _STUDENT_ROLLUP_TARGET_COLUMNS)
+    students_by_tw_id = {
+        item["columns"].get(config.STUDENT_BOARD_COL_TEACHWORKS_ID): item
+        for item in student_items
+        if item["columns"].get(config.STUDENT_BOARD_COL_TEACHWORKS_ID)
+    }
+
+    missing = 0
+    would_update = 0
+    already_correct = 0
+
+    for tw_id in sorted(rollups.keys()):
+        rollup = rollups[tw_id]
+        print(f"\nTeachworks Student ID: {tw_id}")
+        print(
+            f"  Calculated: first_session_date={rollup['first_session_date']} "
+            f"session_count={rollup['session_count']} "
+            f"last_session_date={rollup['last_session_date']} "
+            f"latest_tutor={rollup['latest_tutor']}"
+        )
+
+        student_item = students_by_tw_id.get(tw_id)
+        if not student_item:
+            missing += 1
+            print("  => MISSING MONDAY STUDENT (no Student item with this Teachworks Student ID; will not be created)")
+            continue
+
+        cols = student_item["columns"]
+        current_count_raw = cols.get(config.STUDENT_COL_SESSION_COUNT) or ""
+        try:
+            current_count = int(current_count_raw)
+        except ValueError:
+            current_count = current_count_raw or "(blank)"
+
+        # These four drive the MATCH / WOULD UPDATE verdict. "Session Data
+        # Last Synced" is printed too (required below) but is a bookkeeping
+        # timestamp that's expected to change on every real run, so it does
+        # NOT by itself count as something needing correction.
+        substantive = [
+            ("First Session Date", cols.get(config.STUDENT_COL_FIRST_SESSION_DATE) or "(blank)", rollup["first_session_date"]),
+            ("Session Count", current_count, rollup["session_count"]),
+            ("Last Session Date", cols.get(config.STUDENT_COL_LAST_SESSION_DATE) or "(blank)", rollup["last_session_date"]),
+            ("Tutor", cols.get(config.STUDENT_COL_TUTOR) or "(blank)", rollup["latest_tutor"]),
+        ]
+        for label, current, calculated in substantive:
+            marker = "  <- WOULD CHANGE" if str(current) != str(calculated) else ""
+            print(f"    {label}: {current} -> {calculated}{marker}")
+
+        sync_date_current = cols.get(config.STUDENT_COL_SESSION_DATA_LAST_SYNCED) or "(blank)"
+        print(f"    Session Data Last Synced: {sync_date_current} -> {today}")
+
+        changed = any(str(current) != str(calculated) for _, current, calculated in substantive)
+        if changed:
+            would_update += 1
+            print(f"  => WOULD UPDATE (Monday item {student_item['item_id']})")
+        else:
+            already_correct += 1
+            print(f"  => MATCH (Monday item {student_item['item_id']}, already correct)")
+
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"Teachworks students calculated: {len(rollups)}")
+    print(f"Monday students matched: {len(rollups) - missing}")
+    print(f"Missing Monday students: {missing}")
+    print(f"Students already correct: {already_correct}")
+    print(f"Students that would change: {would_update}")
+
+    print("\n" + "=" * 70)
+    print("DIAGNOSTIC COMPLETE - read-only. Zero Monday writes were made. Zero Teachworks requests were made.")
+    print("=" * 70)
+    return 0
+
+
 def print_report(report):
     verb_created = "Sessions that WOULD be created" if report.mode.startswith("DRY RUN") else "Sessions created"
     lines = [
@@ -597,6 +741,7 @@ def main(argv=None):
     parser.add_argument("--diagnose-teachworks", action="store_true", help="Read-only: test several /lessons query variants and print status/record counts. Makes zero Monday.com calls and zero writes.")
     parser.add_argument("--diagnose-dedup", action="store_true", help="Read-only: compare computed unique keys against Monday's stored unique-ID column to investigate duplicate-detection results. Reads Monday.com but makes zero writes.")
     parser.add_argument("--diagnose-student-columns", action="store_true", help="Read-only: print every column (title/ID/type) on the configured Students board. Reads Monday.com but makes zero writes.")
+    parser.add_argument("--diagnose-student-rollups", action="store_true", help="Read-only: calculate lifetime student rollups from the Session Log board and compare against current Monday Student values. Reads Monday.com but makes zero writes and zero Teachworks requests.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (default INFO).")
     args = parser.parse_args(argv)
 
@@ -641,6 +786,9 @@ def main(argv=None):
 
     if args.diagnose_student_columns:
         return diagnose_student_columns(monday_client)
+
+    if args.diagnose_student_rollups:
+        return diagnose_student_rollups(monday_client)
 
     if args.diagnose_dedup:
         return diagnose_dedup(tw_client, monday_client, start_date, end_date)

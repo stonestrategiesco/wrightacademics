@@ -67,6 +67,17 @@ COL_AMOUNT = "numeric_mm5r8r3g"
 
 STUDENT_BOARD_COL_TEACHWORKS_ID = "text_mm3gj3hy"
 
+# Confirmed via `sync.py --diagnose-student-columns` against the real
+# Students board. Used for the read-only rollup diagnostic; no write code
+# exists yet for any of these.
+STUDENT_COL_FIRST_SESSION_DATE = "date_mm5g76js"
+STUDENT_COL_SESSION_COUNT = "numeric_mm4cpxr0"
+STUDENT_COL_LAST_SESSION_DATE = "date_mm4cgyym"
+STUDENT_COL_TUTOR = "text_mm5g2f0e"
+STUDENT_COL_SESSION_DATA_LAST_SYNCED = "date_mm5gk46f"
+# Confirmed but intentionally NOT read or written by any rollup code yet.
+STUDENT_COL_MILESTONES = "color_mm4c964d"
+
 
 def validate():
     """Raise ConfigError with a clear message if required credentials are missing.

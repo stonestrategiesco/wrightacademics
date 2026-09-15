@@ -163,7 +163,43 @@ actually found by exact title match — never guessed or invented. Use this
 to get real column IDs before writing any code that updates student-level
 metrics.
 
-## 5. Investigating zero (or unexpected) duplicate-detection results
+## 5. Calculating student rollups (Stage 1 — read-only, no writes yet)
+
+```bash
+python sync.py --diagnose-student-rollups
+```
+
+Read-only, makes **zero Monday writes and zero Teachworks requests**.
+Calculates, for every Teachworks Student ID represented on the Session Log
+board: First Session Date (earliest session date), Session Count (lifetime
+count), Last Session Date (latest session date), and Tutor (tutor on the
+latest session, ties broken deterministically). Matches to the Students
+board **strictly by Teachworks Student ID** (`text_mm3gj3hy`) — never by
+name — and prints `CURRENT -> CALCULATED` for each field plus a verdict:
+`MATCH` (already correct), `WOULD UPDATE`, or `MISSING MONDAY STUDENT` (a
+Session Log student with no matching Student item — never auto-created,
+same rule as the Session Log sync). Ends with a summary of students
+calculated, matched, missing, already-correct, and would-change.
+
+**Why this doesn't crawl Teachworks history:** the Session Log board is
+already a faithful, incrementally-synced copy of every Teachworks attended
+participant session the locked sync has ever ingested. Recomputing rollups
+from a fresh Teachworks query would mean querying every calendar day since
+each student's history began (day-by-day is the only reliable mode — see
+above) — potentially thousands of requests. Reading the Session Log board
+instead costs one full paginated read, the same cost `get_existing_unique_ids`
+already pays on every sync run today. The tradeoff: these rollups are only
+as complete as what's already been synced to Monday, and the locked sync
+never deletes/corrects an item if Teachworks later reverses an attendance
+record — see the architecture discussion in this project's history for
+more detail. `Session Data Last Synced` is always shown as changing to
+today's date, since it's a bookkeeping timestamp expected to update on every
+real run — it doesn't by itself trigger `WOULD UPDATE`.
+
+There is no write/update mode yet — Stage 2 (the actual Monday write) is
+separate, deliberately not built until Stage 1's numbers are reviewed.
+
+## 6. Investigating zero (or unexpected) duplicate-detection results
 
 ```bash
 python sync.py --diagnose-dedup --lookback-days 2
@@ -201,7 +237,7 @@ production deduplication — only the exact composite/legacy key match run
 by `run_sync()` is. This diagnostic exists purely to investigate, not to
 change, dedup behavior.
 
-## 6. Dry run (no writes — safe to run anytime)
+## 7. Dry run (no writes — safe to run anytime)
 
 ```bash
 python sync.py --dry-run
@@ -238,7 +274,7 @@ RESULT: COMPLETED - all sessions synced, but some student connections need atten
 ======================================================================
 ```
 
-## 7. Normal sync (writes to Monday)
+## 8. Normal sync (writes to Monday)
 
 ```bash
 python sync.py
@@ -248,7 +284,7 @@ Checks the last `LOOKBACK_DAYS` days (default 3) and creates any missing
 Session Log items. Safe to run repeatedly — this is what the nightly
 schedule runs.
 
-## 8. Full reconciliation
+## 9. Full reconciliation
 
 ```bash
 python sync.py --full
@@ -300,7 +336,7 @@ real credentials required. They cover:
 
 ---
 
-## 9. Deploying to Railway
+## 10. Deploying to Railway
 
 1. Push this repository to GitHub (see below).
 2. In Railway: **New Project → Deploy from GitHub repo**, select this repo.
@@ -313,7 +349,7 @@ real credentials required. They cover:
 5. Under **Settings → Build**, Railway will run `pip install -r requirements.txt`
    automatically (Nixpacks detects `requirements.txt`).
 
-## 10. Configuring the nightly schedule
+## 11. Configuring the nightly schedule
 
 Railway supports **Cron Schedules** on a service:
 
@@ -330,7 +366,7 @@ Railway supports **Cron Schedules** on a service:
 Do **not** put `--full` in the scheduled command — that's for manual,
 occasional reconciliation only.
 
-## 11. Inspecting logs
+## 12. Inspecting logs
 
 Every run prints a plain-text report (see the dry-run example above) plus
 line-by-line logs for anything notable (`MISSING_STUDENT`, `CREATE_ERROR`,
@@ -345,7 +381,7 @@ tells you at a glance whether the run needs attention:
 A non-developer can read that one line to know whether the night's sync was
 clean.
 
-## 12. Giving / revoking developer access later
+## 13. Giving / revoking developer access later
 
 This integration is just a GitHub repo plus a Railway project — both owned
 by whichever GitHub/Railway account Wright Academics controls.

@@ -17,11 +17,15 @@ class FakeTeachworksClient(TeachworksClient):
 
 
 class FakeMondayClient:
-    def __init__(self, existing_ids=None, student_lookup=None, items=None, board_columns=None):
+    def __init__(self, existing_ids=None, student_lookup=None, items=None, student_items=None, board_columns=None):
         self.existing_ids = set(existing_ids or [])
         self.student_lookup = dict(student_lookup or {})
-        # items: list of {"item_id": ..., "item_name": ..., "columns": {col_id: text}}, used by get_items()
+        # items: list of {"item_id": ..., "item_name": ..., "columns": {col_id: text}},
+        # served by get_items() for the Sessions board (the default/only board
+        # in most tests). student_items: same shape, served for the Students
+        # board specifically - only needed by tests that read both boards.
         self.items = list(items or [])
+        self.student_items = list(student_items or [])
         # board_columns: list of {"id": ..., "title": ..., "type": ...}, used by get_board_columns()
         self.board_columns = list(board_columns or [])
         self.created_items = []
@@ -60,13 +64,14 @@ class FakeMondayClient:
         return item_id
 
     def get_items(self, board_id, column_ids):
+        source = self.student_items if board_id == config.MONDAY_STUDENTS_BOARD_ID else self.items
         return [
             {
                 "item_id": item["item_id"],
                 "item_name": item.get("item_name", ""),
                 "columns": {col: item["columns"].get(col, "") for col in column_ids},
             }
-            for item in self.items
+            for item in source
         ]
 
     def get_board_columns(self, board_id):
