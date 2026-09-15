@@ -108,8 +108,16 @@ def run_sync(tw_client, monday_client, start_date, end_date, dry_run=False, mode
 
     for session in sessions:
         unique_key = session["unique_key"]
+        # Backward compatibility with the legacy Zapier sync, which stored
+        # only the bare lesson_id in this column (no student component).
+        # existing_ids already holds whatever raw strings are actually in
+        # Monday's unique-ID column - legacy or composite - so checking both
+        # forms against that same set requires no migration and no separate
+        # lookup. New records always store the composite key; the legacy
+        # form is only ever checked, never written.
+        legacy_key = str(session["lesson_id"]) if session.get("lesson_id") is not None else None
 
-        if unique_key in existing_ids:
+        if unique_key in existing_ids or (legacy_key is not None and legacy_key in existing_ids):
             report.sessions_skipped += 1
             continue
 

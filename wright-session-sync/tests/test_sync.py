@@ -163,3 +163,126 @@ def test_duplicate_protection_holds_across_teachworks_day_by_day_requests():
     assert report.sessions_created == 1
     assert report.sessions_skipped == 1
     assert len(monday.created_items) == 1
+
+
+# --- Legacy Zapier unique-ID backward compatibility ----------------------
+#
+# The legacy Zap stored ONLY the bare lesson_id in text_mm5h9n9g (no student
+# component). New records store the composite {lesson_id}_{student_id} key.
+# Both formats can coexist on the board, unmigrated, and both must be
+# recognized as "already exists" - the legacy form is only ever checked,
+# never written.
+
+def test_existing_composite_key_is_skipped_as_duplicate():
+    lesson = make_lesson(94419922, "2026-09-13", [make_participant(2246673, "Someone")])
+    tw = FakeTeachworksClient([lesson])
+    monday = FakeMondayClient(existing_ids={"94419922_2246673"})
+
+    report = run_sync(tw, monday, "2026-09-13", "2026-09-13")
+
+    assert report.sessions_skipped == 1
+    assert report.sessions_created == 0
+    assert monday.created_items == []
+
+
+def test_existing_legacy_lesson_only_key_is_skipped_as_duplicate():
+    lesson = make_lesson(94419922, "2026-09-13", [make_participant(2246673, "Someone")])
+    tw = FakeTeachworksClient([lesson])
+    monday = FakeMondayClient(existing_ids={"94419922"})  # legacy format: lesson_id only
+
+    report = run_sync(tw, monday, "2026-09-13", "2026-09-13")
+
+    assert report.sessions_skipped == 1
+    assert report.sessions_created == 0
+    assert monday.created_items == []
+
+
+def test_neither_key_exists_creates_item_with_composite_key():
+    lesson = make_lesson(94419922, "2026-09-13", [make_participant(2246673, "Someone")])
+    tw = FakeTeachworksClient([lesson])
+    monday = FakeMondayClient()  # nothing existing at all
+
+    report = run_sync(tw, monday, "2026-09-13", "2026-09-13")
+
+    assert report.sessions_created == 1
+    assert len(monday.created_items) == 1
+    # ALWAYS stores the composite key on new records - never the legacy form.
+    assert monday.created_items[0]["column_values"][config.COL_UNIQUE_ID] == "94419922_2246673"
+
+
+def test_legacy_key_double_run_idempotency_remains_intact():
+    lesson = make_lesson(94419922, "2026-09-13", [make_participant(2246673, "Someone")])
+    tw = FakeTeachworksClient([lesson])
+    monday = FakeMondayClient(existing_ids={"94419922"})
+
+    first = run_sync(tw, monday, "2026-09-13", "2026-09-13")
+    second = run_sync(tw, monday, "2026-09-13", "2026-09-13")
+
+    assert first.sessions_created == 0
+    assert first.sessions_skipped == 1
+    assert second.sessions_created == 0
+    assert second.sessions_skipped == 1
+    assert monday.created_items == []
+
+
+def test_multi_student_new_lesson_creates_both_composite_keys():
+    lesson = make_lesson(99999, "2026-09-13", [
+        make_participant(111, "Alice"),
+        make_participant(222, "Bob"),
+    ])
+    tw = FakeTeachworksClient([lesson])
+    monday = FakeMondayClient()  # nothing existing
+
+    report = run_sync(tw, monday, "2026-09-13", "2026-09-13")
+
+    assert report.sessions_created == 2
+    keys = {item["column_values"][config.COL_UNIQUE_ID] for item in monday.created_items}
+    assert keys == {"99999_111", "99999_222"}
+
+
+def test_legacy_multi_student_lesson_skips_both_participants():
+    """The legacy Zap represented this whole lesson with one bare lesson_id
+    record. Neither of the new per-participant composite keys should be
+    created - both participants are already covered by that legacy record."""
+    lesson = make_lesson(99999, "2026-09-13", [
+        make_participant(111, "Alice"),
+        make_participant(222, "Bob"),
+    ])
+    tw = FakeTeachworksClient([lesson])
+    monday = FakeMondayClient(existing_ids={"99999"})  # legacy: lesson-only
+
+    report = run_sync(tw, monday, "2026-09-13", "2026-09-13")
+
+    assert report.sessions_created == 0
+    assert report.sessions_skipped == 2
+    assert monday.created_items == []
+
+
+def test_mixed_legacy_and_composite_existing_ids_are_each_recognized_correctly():
+    lessons = [
+        make_lesson(100, "2026-09-13", [make_participant(1, "Legacy Match")]),      # matches legacy "100"
+        make_lesson(200, "2026-09-13", [make_participant(2, "Composite Match")]),   # matches composite "200_2"
+        make_lesson(300, "2026-09-13", [make_participant(3, "Brand New")]),         # matches neither
+    ]
+    tw = FakeTeachworksClient(lessons)
+    monday = FakeMondayClient(existing_ids={"100", "200_2"})
+
+    report = run_sync(tw, monday, "2026-09-13", "2026-09-13")
+
+    assert report.sessions_skipped == 2  # the legacy and composite matches
+    assert report.sessions_created == 1  # only the brand-new one
+    assert len(monday.created_items) == 1
+    assert monday.created_items[0]["column_values"][config.COL_UNIQUE_ID] == "300_3"
+
+
+def test_legacy_key_match_is_also_respected_during_dry_run():
+    lesson = make_lesson(94419922, "2026-09-13", [make_participant(2246673, "Someone")])
+    tw = FakeTeachworksClient([lesson])
+    monday = FakeMondayClient(existing_ids={"94419922"})
+
+    report = run_sync(tw, monday, "2026-09-13", "2026-09-13", dry_run=True)
+
+    assert report.sessions_created == 0
+    assert report.sessions_skipped == 1
+    assert monday.created_items == []
+    assert monday.connections == []

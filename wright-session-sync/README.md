@@ -27,13 +27,20 @@ schedule.
    returns **zero** records even when matching data exists, so this issues
    one `from_date == to_date` request **per calendar date** in the range
    instead, each fully paginated independently, and combines the results.
-4. For every **attended** participant on every lesson, builds the key
-   `{teachworks_lesson_id}_{teachworks_student_id}`.
-   - If that key already exists on the board → skip.
-   - If not → create a new Session Log item, immediately record its key in
-     memory (so the same run can never create it twice), and connect it to
-     the matching Student item if one was found. If no Student is found,
-     the Session Log item is still created, but a `MISSING_STUDENT` line is
+4. For every **attended** participant on every lesson, builds the composite
+   key `{teachworks_lesson_id}_{teachworks_student_id}`.
+   - A session is treated as an existing duplicate if EITHER that composite
+     key OR the bare `{teachworks_lesson_id}` (as a string) already exists
+     in Monday's unique-ID column → skip, don't touch the existing item.
+     The bare-lesson-ID check exists because the legacy Zapier sync stored
+     only the lesson ID (no student component) for records it created —
+     those are never migrated or rewritten, just recognized. New records
+     always store the composite key, never the bare lesson ID.
+   - If neither exists → create a new Session Log item (composite key
+     stored in the unique-ID column), immediately record that key in memory
+     (so the same run can never create it twice), and connect it to the
+     matching Student item if one was found. If no Student is found, the
+     Session Log item is still created, but a `MISSING_STUDENT` line is
      logged and included in the run's report — no Student is ever
      auto-created.
 
