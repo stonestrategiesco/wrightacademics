@@ -41,6 +41,38 @@ def test_get_existing_unique_ids_paginates_fully():
     assert session.post.call_count == 2
 
 
+def test_get_board_columns_returns_title_id_and_type():
+    session = MagicMock()
+    session.post.return_value = _response(200, {
+        "data": {
+            "boards": [{
+                "columns": [
+                    {"id": "text_mm3gj3hy", "title": "Teachworks Student ID", "type": "text"},
+                    {"id": "numeric_abc123", "title": "Session Count", "type": "numeric"},
+                ],
+            }],
+        },
+    })
+
+    client = MondayClient(api_token="token", session=session)
+    columns = client.get_board_columns(18413873041)
+
+    assert columns == [
+        {"id": "text_mm3gj3hy", "title": "Teachworks Student ID", "type": "text"},
+        {"id": "numeric_abc123", "title": "Session Count", "type": "numeric"},
+    ]
+    assert session.post.call_count == 1
+
+
+def test_get_board_columns_raises_if_board_not_found():
+    session = MagicMock()
+    session.post.return_value = _response(200, {"data": {"boards": []}})
+
+    client = MondayClient(api_token="token", session=session)
+    with pytest.raises(MondayAPIError):
+        client.get_board_columns(18413873041)
+
+
 def test_get_items_returns_multiple_columns_per_item_and_paginates():
     session = MagicMock()
     session.post.side_effect = [

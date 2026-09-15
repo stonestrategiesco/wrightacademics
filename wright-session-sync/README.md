@@ -148,7 +148,22 @@ fetched, total lessons seen, and the earliest/latest `from_date` across all
 of them — without printing every individual lesson. This shows the full
 extent of what this credential can actually see.
 
-## 4. Investigating zero (or unexpected) duplicate-detection results
+## 4. Discovering real Students board column IDs (before any student-metric write code)
+
+```bash
+python sync.py --diagnose-student-columns
+```
+
+Read-only — reads the Students board schema (not items), makes **zero
+Monday writes**. Prints every column defined on the configured Students
+board with its title, column ID, and type, then flags which of a specific
+list of expected columns (First Session, Session Count, Last session Date,
+Tutor, Session Data Last Updated, Milestones, Teachworks Student ID) were
+actually found by exact title match — never guessed or invented. Use this
+to get real column IDs before writing any code that updates student-level
+metrics.
+
+## 5. Investigating zero (or unexpected) duplicate-detection results
 
 ```bash
 python sync.py --diagnose-dedup --lookback-days 2
@@ -186,7 +201,7 @@ production deduplication — only the exact composite/legacy key match run
 by `run_sync()` is. This diagnostic exists purely to investigate, not to
 change, dedup behavior.
 
-## 5. Dry run (no writes — safe to run anytime)
+## 6. Dry run (no writes — safe to run anytime)
 
 ```bash
 python sync.py --dry-run
@@ -223,7 +238,7 @@ RESULT: COMPLETED - all sessions synced, but some student connections need atten
 ======================================================================
 ```
 
-## 6. Normal sync (writes to Monday)
+## 7. Normal sync (writes to Monday)
 
 ```bash
 python sync.py
@@ -233,7 +248,7 @@ Checks the last `LOOKBACK_DAYS` days (default 3) and creates any missing
 Session Log items. Safe to run repeatedly — this is what the nightly
 schedule runs.
 
-## 7. Full reconciliation
+## 8. Full reconciliation
 
 ```bash
 python sync.py --full
@@ -285,7 +300,7 @@ real credentials required. They cover:
 
 ---
 
-## 8. Deploying to Railway
+## 9. Deploying to Railway
 
 1. Push this repository to GitHub (see below).
 2. In Railway: **New Project → Deploy from GitHub repo**, select this repo.
@@ -298,7 +313,7 @@ real credentials required. They cover:
 5. Under **Settings → Build**, Railway will run `pip install -r requirements.txt`
    automatically (Nixpacks detects `requirements.txt`).
 
-## 9. Configuring the nightly schedule
+## 10. Configuring the nightly schedule
 
 Railway supports **Cron Schedules** on a service:
 
@@ -315,7 +330,7 @@ Railway supports **Cron Schedules** on a service:
 Do **not** put `--full` in the scheduled command — that's for manual,
 occasional reconciliation only.
 
-## 10. Inspecting logs
+## 11. Inspecting logs
 
 Every run prints a plain-text report (see the dry-run example above) plus
 line-by-line logs for anything notable (`MISSING_STUDENT`, `CREATE_ERROR`,
@@ -330,7 +345,7 @@ tells you at a glance whether the run needs attention:
 A non-developer can read that one line to know whether the night's sync was
 clean.
 
-## 11. Giving / revoking developer access later
+## 12. Giving / revoking developer access later
 
 This integration is just a GitHub repo plus a Railway project — both owned
 by whichever GitHub/Railway account Wright Academics controls.

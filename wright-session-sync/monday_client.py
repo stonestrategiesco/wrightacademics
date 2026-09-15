@@ -161,6 +161,29 @@ class MondayClient:
             results.append({"item_id": item["id"], "item_name": item.get("name"), "columns": columns})
         return results
 
+    def get_board_columns(self, board_id):
+        """Read-only: return every column defined on a board, as a list of
+        {'id': ..., 'title': ..., 'type': ...}. A single query, no
+        pagination needed (board schema, not items). Makes no writes of
+        any kind - used to discover real column IDs before any write code
+        is built against them."""
+        query = """
+        query ($boardId: [ID!]) {
+          boards(ids: $boardId) {
+            columns {
+              id
+              title
+              type
+            }
+          }
+        }
+        """
+        data = self._execute(query, {"boardId": [str(board_id)]})
+        boards = data.get("boards") or []
+        if not boards:
+            raise MondayAPIError(f"Monday board {board_id} not found or not accessible with this token")
+        return boards[0]["columns"]
+
     def get_student_lookup(self, board_id, teachworks_id_column):
         """Return {teachworks_student_id (str): monday_item_id (str)} for every
         Student item that has a Teachworks Student ID populated."""

@@ -469,6 +469,59 @@ def diagnose_dedup(tw_client, monday_client, start_date, end_date):
     return 0
 
 
+# Column titles we're trying to locate on the Students board before writing
+# any student-metric code. Matched by exact title text against whatever the
+# real API returns - never invented, never guessed from a screenshot.
+_STUDENT_COLUMNS_OF_INTEREST = [
+    "First Session",
+    "Session Count",
+    "Last session Date",
+    "Tutor",
+    "Session Data Last Updated",
+    "Milestones",
+    "Teachworks Student ID",
+]
+
+
+def diagnose_student_columns(monday_client):
+    """Read-only: prints every column defined on the configured Students
+    board (title, column ID, type), then flags which of the specific
+    columns we're looking for were actually found. Makes ZERO Monday
+    writes - this is schema discovery only, ahead of building any
+    student-metric write code."""
+    print("=" * 70)
+    print("STUDENT BOARD COLUMN DIAGNOSTIC (read-only, zero Monday writes)")
+    print(f"Board ID: {config.MONDAY_STUDENTS_BOARD_ID}")
+    print("=" * 70)
+
+    columns = monday_client.get_board_columns(config.MONDAY_STUDENTS_BOARD_ID)
+
+    print(f"\n{len(columns)} column(s) found on this board:\n")
+    title_width = max([len(c.get("title") or "") for c in columns] + [5])
+    id_width = max([len(c.get("id") or "") for c in columns] + [9])
+    header = f"{'TITLE':<{title_width}}  {'COLUMN ID':<{id_width}}  TYPE"
+    print(header)
+    print("-" * len(header))
+    for col in columns:
+        print(f"{(col.get('title') or ''):<{title_width}}  {(col.get('id') or ''):<{id_width}}  {col.get('type') or ''}")
+
+    print("\n" + "-" * 70)
+    print("Columns of interest for student-metric rollups (exact title match):")
+    print("-" * 70)
+    by_title = {(c.get("title") or "").strip().lower(): c for c in columns}
+    for wanted in _STUDENT_COLUMNS_OF_INTEREST:
+        match = by_title.get(wanted.strip().lower())
+        if match:
+            print(f"  FOUND     {wanted!r:<28} -> id={match['id']}  type={match['type']}")
+        else:
+            print(f"  NOT FOUND {wanted!r:<28} (no column with this exact title on the board)")
+
+    print("\n" + "=" * 70)
+    print("DIAGNOSTIC COMPLETE - read-only. Zero Monday writes were made.")
+    print("=" * 70)
+    return 0
+
+
 def print_report(report):
     verb_created = "Sessions that WOULD be created" if report.mode.startswith("DRY RUN") else "Sessions created"
     lines = [
@@ -543,6 +596,7 @@ def main(argv=None):
     parser.add_argument("--dump-sample", action="store_true", help="Print one raw Teachworks lesson JSON and exit (for verifying field names).")
     parser.add_argument("--diagnose-teachworks", action="store_true", help="Read-only: test several /lessons query variants and print status/record counts. Makes zero Monday.com calls and zero writes.")
     parser.add_argument("--diagnose-dedup", action="store_true", help="Read-only: compare computed unique keys against Monday's stored unique-ID column to investigate duplicate-detection results. Reads Monday.com but makes zero writes.")
+    parser.add_argument("--diagnose-student-columns", action="store_true", help="Read-only: print every column (title/ID/type) on the configured Students board. Reads Monday.com but makes zero writes.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (default INFO).")
     args = parser.parse_args(argv)
 
@@ -584,6 +638,9 @@ def main(argv=None):
         max_retries=config.MAX_RETRIES,
         retry_base_delay=config.RETRY_BASE_DELAY_SECONDS,
     )
+
+    if args.diagnose_student_columns:
+        return diagnose_student_columns(monday_client)
 
     if args.diagnose_dedup:
         return diagnose_dedup(tw_client, monday_client, start_date, end_date)
