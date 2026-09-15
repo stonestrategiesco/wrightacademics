@@ -666,6 +666,98 @@ def diagnose_student_rollups(monday_client, today=None):
     return 0
 
 
+def _sessions_after_date(session_log_items, baseline_date):
+    """Group Session Log rows with a session date strictly after
+    `baseline_date` by Teachworks Student ID: count, the latest date among
+    them, and the tutor at that latest date (deterministic date+item_id
+    tiebreak, same rule as _aggregate_session_log_by_student)."""
+    rows_by_student = {}
+    for item in session_log_items:
+        cols = item["columns"]
+        tw_id = cols.get(config.COL_TEACHWORKS_STUDENT_ID)
+        session_date = cols.get(config.COL_SESSION_DATE)
+        if not tw_id or not session_date or session_date <= baseline_date:
+            continue
+        tutor = cols.get(config.COL_TUTOR)
+        rows_by_student.setdefault(tw_id, []).append((session_date, item["item_id"], tutor))
+
+    deltas = {}
+    for tw_id, rows in rows_by_student.items():
+        rows.sort(key=lambda row: (row[0], row[1]))
+        deltas[tw_id] = {"count": len(rows), "max_date": rows[-1][0], "tutor_at_max_date": rows[-1][2]}
+    return deltas
+
+
+def diagnose_student_rollup_delta(monday_client, baseline_date):
+    """Read-only validation of a baseline+delta rollup architecture, as an
+    alternative to Stage 1's full-recompute-from-Session-Log approach
+    (--diagnose-student-rollups). Restricts to Monday Students whose
+    CURRENT Session Data Last Synced value equals `baseline_date` exactly,
+    counts Session Log records strictly after that date, and shows what a
+    baseline+delta approach would propose next to the student's current
+    stored values. This is a comparison report only: it does not write
+    anything, does not touch run_sync() or the Session Log pipeline, and
+    does not decide which architecture gets built."""
+    print("=" * 70)
+    print("STUDENT ROLLUP BASELINE+DELTA VALIDATION (read-only, zero Monday writes)")
+    print(f"Baseline date: {baseline_date}")
+    print("=" * 70)
+
+    student_items = monday_client.get_items(config.MONDAY_STUDENTS_BOARD_ID, _STUDENT_ROLLUP_TARGET_COLUMNS)
+    baseline_students = [
+        item for item in student_items
+        if item["columns"].get(config.STUDENT_COL_SESSION_DATA_LAST_SYNCED) == baseline_date
+    ]
+
+    print(f"\n{len(baseline_students)} student(s) with Session Data Last Synced == {baseline_date}.")
+
+    if baseline_students:
+        session_log_items = monday_client.get_items(config.MONDAY_SESSIONS_BOARD_ID, _SESSION_LOG_ROLLUP_SOURCE_COLUMNS)
+        deltas = _sessions_after_date(session_log_items, baseline_date)
+
+        header = (
+            f"Student | Current Session Count | Sessions after {baseline_date} | Proposed New Count | "
+            "Current Last Session | New Last Session | Current Tutor | New Tutor"
+        )
+        print(f"\n{header}")
+        print("-" * len(header))
+
+        for item in sorted(baseline_students, key=lambda i: i.get("item_name") or ""):
+            cols = item["columns"]
+            tw_id = cols.get(config.STUDENT_BOARD_COL_TEACHWORKS_ID)
+            student_name = item.get("item_name") or "(unnamed)"
+
+            current_count_raw = cols.get(config.STUDENT_COL_SESSION_COUNT) or ""
+            try:
+                current_count = int(current_count_raw)
+            except ValueError:
+                current_count = 0
+
+            current_last_session = cols.get(config.STUDENT_COL_LAST_SESSION_DATE) or "(blank)"
+            current_tutor = cols.get(config.STUDENT_COL_TUTOR) or "(blank)"
+
+            delta = deltas.get(tw_id)
+            sessions_after = delta["count"] if delta else 0
+            proposed_new_count = current_count + sessions_after
+
+            if delta and (current_last_session == "(blank)" or delta["max_date"] > current_last_session):
+                new_last_session = delta["max_date"]
+                new_tutor = delta["tutor_at_max_date"]
+            else:
+                new_last_session = current_last_session
+                new_tutor = current_tutor
+
+            print(
+                f"{student_name} | {current_count} | {sessions_after} | {proposed_new_count} | "
+                f"{current_last_session} | {new_last_session} | {current_tutor} | {new_tutor}"
+            )
+
+    print("\n" + "=" * 70)
+    print("DIAGNOSTIC COMPLETE - read-only. Zero Monday writes were made.")
+    print("=" * 70)
+    return 0
+
+
 def print_report(report):
     verb_created = "Sessions that WOULD be created" if report.mode.startswith("DRY RUN") else "Sessions created"
     lines = [
@@ -742,6 +834,8 @@ def main(argv=None):
     parser.add_argument("--diagnose-dedup", action="store_true", help="Read-only: compare computed unique keys against Monday's stored unique-ID column to investigate duplicate-detection results. Reads Monday.com but makes zero writes.")
     parser.add_argument("--diagnose-student-columns", action="store_true", help="Read-only: print every column (title/ID/type) on the configured Students board. Reads Monday.com but makes zero writes.")
     parser.add_argument("--diagnose-student-rollups", action="store_true", help="Read-only: calculate lifetime student rollups from the Session Log board and compare against current Monday Student values. Reads Monday.com but makes zero writes and zero Teachworks requests.")
+    parser.add_argument("--diagnose-student-rollup-delta", action="store_true", help="Read-only: validate a baseline+delta rollup approach for students whose current Session Data Last Synced equals --baseline-date. Reads Monday.com but makes zero writes.")
+    parser.add_argument("--baseline-date", default=None, help="YYYY-MM-DD baseline date, required by --diagnose-student-rollup-delta.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (default INFO).")
     args = parser.parse_args(argv)
 
@@ -789,6 +883,12 @@ def main(argv=None):
 
     if args.diagnose_student_rollups:
         return diagnose_student_rollups(monday_client)
+
+    if args.diagnose_student_rollup_delta:
+        if not args.baseline_date:
+            print("ERROR: --diagnose-student-rollup-delta requires --baseline-date YYYY-MM-DD")
+            return 1
+        return diagnose_student_rollup_delta(monday_client, args.baseline_date)
 
     if args.diagnose_dedup:
         return diagnose_dedup(tw_client, monday_client, start_date, end_date)

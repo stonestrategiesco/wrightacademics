@@ -199,6 +199,22 @@ real run — it doesn't by itself trigger `WOULD UPDATE`.
 There is no write/update mode yet — Stage 2 (the actual Monday write) is
 separate, deliberately not built until Stage 1's numbers are reviewed.
 
+### Validating an alternative baseline+delta approach
+
+```bash
+python sync.py --diagnose-student-rollup-delta --baseline-date 2026-09-10
+```
+
+Read-only, zero writes. A separate, smaller check: for Monday Students
+whose **current** `Session Data Last Synced` value equals `--baseline-date`
+exactly, counts Session Log records strictly *after* that date and reports
+`Student | Current Session Count | Sessions after <date> | Proposed New
+Count | Current Last Session | New Last Session | Current Tutor | New
+Tutor`. This validates a baseline+delta computation (current stored value +
+what's changed since) as a point of comparison against Stage 1's
+full-recompute approach — it doesn't decide which one gets built, and
+doesn't write anything either way.
+
 ## 6. Investigating zero (or unexpected) duplicate-detection results
 
 ```bash
