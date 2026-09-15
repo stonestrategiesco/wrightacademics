@@ -758,6 +758,200 @@ def diagnose_student_rollup_delta(monday_client, baseline_date):
     return 0
 
 
+# --- Stage 2: production-ready Student rollup calculation --------------
+#
+# Runs AFTER the Session Log sync (run_sync(), unchanged) in the intended
+# nightly architecture, but is a fully separate step: it never touches
+# run_sync(), the dedup/date-retrieval/normalization logic, or the Session
+# Log write path. It iterates every MONDAY STUDENT item (not Teachworks-
+# derived sessions) - matching "do not update all 1,096 students every
+# night" - and uses EACH student's own currently-stored
+# Session Data Last Synced value as ITS OWN checkpoint. First Session Date
+# is intentionally never read into the update payload here: it must never
+# be recalculated or overwritten.
+#
+# Includes config.COL_UNIQUE_ID (unlike Stage 1's source columns) so
+# duplicate Session Log rows sharing a unique key are only ever counted
+# once, defending against any stray duplicate Monday items.
+_STUDENT_ROLLUP_V2_SOURCE_COLUMNS = [
+    config.COL_UNIQUE_ID,
+    config.COL_TEACHWORKS_STUDENT_ID,
+    config.COL_SESSION_DATE,
+    config.COL_TUTOR,
+]
+
+
+def _group_session_log_rows_by_student(session_log_items):
+    """Dedupe Session Log rows by their own unique-ID column (a repeated
+    unique key is only ever counted once), then group by Teachworks
+    Student ID. Returns {tw_id: [(session_date, item_id, tutor), ...]},
+    each list sorted by (date, item_id) for deterministic "latest" lookups."""
+    deduped = {}
+    for item in session_log_items:
+        unique_key = item["columns"].get(config.COL_UNIQUE_ID)
+        dedup_key = unique_key or item["item_id"]
+        if dedup_key not in deduped:
+            deduped[dedup_key] = item
+
+    rows_by_student = {}
+    for item in deduped.values():
+        cols = item["columns"]
+        tw_id = cols.get(config.COL_TEACHWORKS_STUDENT_ID)
+        session_date = cols.get(config.COL_SESSION_DATE)
+        if not tw_id or not session_date:
+            continue
+        tutor = cols.get(config.COL_TUTOR)
+        rows_by_student.setdefault(tw_id, []).append((session_date, item["item_id"], tutor))
+
+    for rows in rows_by_student.values():
+        rows.sort(key=lambda row: (row[0], row[1]))
+    return rows_by_student
+
+
+def compute_student_rollup_updates(monday_client, today=None):
+    """Calculates, for every Monday Student item, what a baseline+delta
+    rollup update would be. Read-only: calls monday_client.get_items() only,
+    never any write method.
+
+    Per student: checkpoint = that student's OWN current Session Data Last
+    Synced value. A blank checkpoint is treated as "no prior checkpoint" -
+    every existing session for that student counts as new (plain string
+    comparison: "" sorts before any real date). New sessions = Session Log
+    rows with session_date strictly greater than the checkpoint.
+
+    If new sessions exist: proposed count = current count + new session
+    count; proposed last session / tutor = the latest new session's date/
+    tutor; the checkpoint WOULD advance to `today` (the run date - not the
+    session date, since the checkpoint means "as of when this last ran",
+    matching the original Stage 1 definition).
+    If no new sessions exist: count, last session, tutor, and checkpoint
+    are all left exactly as they are.
+
+    A Student item with a blank Teachworks Student ID cannot be matched at
+    all; it's reported as unmatched, never modified, never created.
+
+    Returns a list of per-student result dicts."""
+    today = today or datetime.date.today().isoformat()
+
+    session_log_items = monday_client.get_items(config.MONDAY_SESSIONS_BOARD_ID, _STUDENT_ROLLUP_V2_SOURCE_COLUMNS)
+    rows_by_student = _group_session_log_rows_by_student(session_log_items)
+
+    student_items = monday_client.get_items(config.MONDAY_STUDENTS_BOARD_ID, _STUDENT_ROLLUP_TARGET_COLUMNS)
+
+    results = []
+    for item in student_items:
+        cols = item["columns"]
+        tw_id = cols.get(config.STUDENT_BOARD_COL_TEACHWORKS_ID)
+        student_name = item.get("item_name") or "(unnamed)"
+
+        if not tw_id:
+            results.append({
+                "monday_item_id": item["item_id"],
+                "student_name": student_name,
+                "teachworks_student_id": None,
+                "matched": False,
+            })
+            continue
+
+        current_count_raw = cols.get(config.STUDENT_COL_SESSION_COUNT) or ""
+        try:
+            current_count = int(current_count_raw)
+        except ValueError:
+            current_count = 0
+
+        current_last_session = cols.get(config.STUDENT_COL_LAST_SESSION_DATE) or ""
+        current_tutor = cols.get(config.STUDENT_COL_TUTOR) or ""
+        checkpoint = cols.get(config.STUDENT_COL_SESSION_DATA_LAST_SYNCED) or ""
+
+        rows = rows_by_student.get(tw_id, [])
+        new_rows = [row for row in rows if row[0] > checkpoint]
+        has_new_sessions = len(new_rows) > 0
+
+        if has_new_sessions:
+            proposed_last_session = new_rows[-1][0]
+            proposed_tutor = new_rows[-1][2]
+            new_checkpoint = today
+        else:
+            proposed_last_session = current_last_session
+            proposed_tutor = current_tutor
+            new_checkpoint = checkpoint
+
+        results.append({
+            "monday_item_id": item["item_id"],
+            "student_name": student_name,
+            "teachworks_student_id": tw_id,
+            "matched": True,
+            "current_count": current_count,
+            "new_session_count": len(new_rows),
+            "proposed_count": current_count + len(new_rows),
+            "current_last_session": current_last_session or "(blank)",
+            "proposed_last_session": proposed_last_session or "(blank)",
+            "current_tutor": current_tutor or "(blank)",
+            "proposed_tutor": proposed_tutor or "(blank)",
+            "checkpoint_used": checkpoint or "(none - all sessions treated as new)",
+            "new_checkpoint": new_checkpoint,
+            "has_new_sessions": has_new_sessions,
+        })
+    return results
+
+
+def run_student_rollup_dry_run(monday_client, today=None):
+    """Stage 2, combined dry run: runs the real rollup calculation
+    (compute_student_rollup_updates) and reports it. Makes ZERO Monday
+    writes - MondayClient.update_student_columns() exists but is never
+    called from this path. Student writes are not enabled yet."""
+    today = today or datetime.date.today().isoformat()
+
+    print("=" * 70)
+    print("STUDENT ROLLUP - COMBINED DRY RUN (Stage 2, zero Monday writes)")
+    print(f"Run date (would become the new checkpoint for updated students only): {today}")
+    print("=" * 70)
+
+    results = compute_student_rollup_updates(monday_client, today=today)
+
+    unmatched = [r for r in results if not r["matched"]]
+    matched = [r for r in results if r["matched"]]
+    with_new_sessions = [r for r in matched if r["has_new_sessions"]]
+    no_changes = [r for r in matched if not r["has_new_sessions"]]
+    total_new_sessions = sum(r["new_session_count"] for r in with_new_sessions)
+
+    if unmatched:
+        print(f"\n{len(unmatched)} Student item(s) could not be matched (blank Teachworks Student ID) - logged, not created/modified:")
+        for r in sorted(unmatched, key=lambda r: r["student_name"]):
+            print(f"  Monday item {r['monday_item_id']} ({r['student_name']}): no Teachworks Student ID - skipped")
+
+    if with_new_sessions:
+        header = (
+            "Student | Current Count | New Sessions | Proposed Count | "
+            "Current Last Session | Proposed Last Session | Current Tutor | Proposed Tutor"
+        )
+        print(f"\n{header}")
+        print("-" * len(header))
+        for r in sorted(with_new_sessions, key=lambda r: r["student_name"]):
+            print(
+                f"{r['student_name']} | {r['current_count']} | {r['new_session_count']} | {r['proposed_count']} | "
+                f"{r['current_last_session']} | {r['proposed_last_session']} | {r['current_tutor']} | {r['proposed_tutor']}"
+            )
+    else:
+        print("\nNo students have new sessions since their own checkpoint - nothing would change.")
+
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"Students evaluated: {len(results)}")
+    print(f"Students with new sessions: {len(with_new_sessions)}")
+    print(f"Total new sessions represented in student rollups: {total_new_sessions}")
+    print(f"Students with no changes: {len(no_changes)}")
+    print(f"Missing Monday students: {len(unmatched)}")
+    print(f"Students that WOULD be updated: {len(with_new_sessions)}")
+
+    print("\n" + "=" * 70)
+    print("DIAGNOSTIC COMPLETE - read-only. Zero Monday writes were made.")
+    print("update_student_columns() exists but was NOT called. Student writes are not enabled.")
+    print("=" * 70)
+    return 0
+
+
 def print_report(report):
     verb_created = "Sessions that WOULD be created" if report.mode.startswith("DRY RUN") else "Sessions created"
     lines = [
@@ -836,6 +1030,7 @@ def main(argv=None):
     parser.add_argument("--diagnose-student-rollups", action="store_true", help="Read-only: calculate lifetime student rollups from the Session Log board and compare against current Monday Student values. Reads Monday.com but makes zero writes and zero Teachworks requests.")
     parser.add_argument("--diagnose-student-rollup-delta", action="store_true", help="Read-only: validate a baseline+delta rollup approach for students whose current Session Data Last Synced equals --baseline-date. Reads Monday.com but makes zero writes.")
     parser.add_argument("--baseline-date", default=None, help="YYYY-MM-DD baseline date, required by --diagnose-student-rollup-delta.")
+    parser.add_argument("--student-rollups", action="store_true", help="Stage 2: calculate production-ready Student rollup updates (baseline+delta, per-student checkpoint). Currently only runs combined with --dry-run; Student writes are not enabled yet.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (default INFO).")
     args = parser.parse_args(argv)
 
@@ -889,6 +1084,12 @@ def main(argv=None):
             print("ERROR: --diagnose-student-rollup-delta requires --baseline-date YYYY-MM-DD")
             return 1
         return diagnose_student_rollup_delta(monday_client, args.baseline_date)
+
+    if args.student_rollups:
+        if not args.dry_run:
+            print("ERROR: --student-rollups currently only supports --dry-run. Student writes are not enabled yet.")
+            return 1
+        return run_student_rollup_dry_run(monday_client)
 
     if args.diagnose_dedup:
         return diagnose_dedup(tw_client, monday_client, start_date, end_date)

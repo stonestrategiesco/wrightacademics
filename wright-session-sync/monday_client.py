@@ -231,3 +231,27 @@ class MondayClient:
             "value": value,
         })
         return data["change_column_value"]["id"]
+
+    def update_student_columns(self, board_id, item_id, column_values):
+        """Replace several column values on an EXISTING item in one mutation
+        (`change_multiple_column_values`), mirroring create_session_item's
+        column_values shape/encoding. Intended for Student rollup updates.
+
+        NOT YET CALLED BY ANY PRODUCTION PATH as of Stage 2: sync.py only
+        runs the rollup calculation in a read-only dry-run mode. This method
+        exists and is unit-tested so it's ready when writes are enabled,
+        but nothing in main() invokes it yet."""
+        clean_values = {k: v for k, v in column_values.items() if v is not None}
+        mutation = """
+        mutation ($boardId: ID!, $itemId: ID!, $columnValues: JSON!) {
+          change_multiple_column_values(board_id: $boardId, item_id: $itemId, column_values: $columnValues) {
+            id
+          }
+        }
+        """
+        data = self._execute(mutation, {
+            "boardId": str(board_id),
+            "itemId": str(item_id),
+            "columnValues": json.dumps(clean_values),
+        })
+        return data["change_multiple_column_values"]["id"]

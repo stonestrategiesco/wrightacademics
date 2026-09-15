@@ -215,6 +215,50 @@ what's changed since) as a point of comparison against Stage 1's
 full-recompute approach — it doesn't decide which one gets built, and
 doesn't write anything either way.
 
+### Stage 2 — production-ready calculation, still dry-run only
+
+```bash
+python sync.py --student-rollups --dry-run
+```
+
+This is the real, production-shaped rollup logic (chosen after Stage 1's
+baseline+delta validation) — not a throwaway diagnostic — but **Student
+writes are not enabled yet**: `--student-rollups` without `--dry-run` is
+refused at the CLI level (prints an error, exits 1), and
+`MondayClient.update_student_columns()` exists and is unit-tested but is
+never called by anything reachable from `main()`.
+
+Runs after the Session Log sync in the intended nightly architecture, but
+is completely separate code — it never touches `run_sync()`, dedup, the
+Teachworks day-by-day retrieval, or normalization. It evaluates **every**
+Monday Student item (not just ones with synced sessions — this is what lets
+it correctly report "no changes" for the majority of students instead of
+touching all ~1,096 every night) and uses each student's own **current**
+`Session Data Last Synced` value as that student's individual checkpoint:
+
+- **First Session Date is never read or recalculated** — untouched, by design.
+- New sessions = Session Log rows with a session date strictly *after* that
+  student's own checkpoint. A **blank checkpoint** is treated as "never
+  synced" — every existing session for that student counts as new.
+- Session Log rows are deduplicated by their own unique-ID column before
+  counting, so a stray duplicate Monday item never double-counts a session.
+- If new sessions exist: proposed count = current + new sessions; proposed
+  last session/tutor = the latest new session's date/tutor; the checkpoint
+  would advance to the run date (not the session date — it means "as of
+  when this last ran").
+- If no new sessions exist: count, last session, tutor, and the checkpoint
+  are all left exactly as they are — this is what keeps most students
+  untouched on any given night.
+- A Student item with a **blank Teachworks Student ID** can't be matched at
+  all; it's logged and skipped, never modified, never created.
+
+Report format: `Student | Current Count | New Sessions | Proposed Count |
+Current Last Session | Proposed Last Session | Current Tutor | Proposed
+Tutor`, for students with at least one new session, followed by a summary:
+students evaluated, students with new sessions, total new sessions
+represented, students with no changes, missing Monday students, and
+students that WOULD be updated.
+
 ## 6. Investigating zero (or unexpected) duplicate-detection results
 
 ```bash

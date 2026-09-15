@@ -183,3 +183,22 @@ def test_create_session_item_sends_expected_mutation_shape():
     sent_body = session.post.call_args.kwargs["json"]
     assert "skip_me" not in sent_body["variables"]["columnValues"]
     assert "1_1" in sent_body["variables"]["columnValues"]
+
+
+def test_update_student_columns_sends_expected_mutation_shape():
+    session = MagicMock()
+    session.post.return_value = _response(200, {"data": {"change_multiple_column_values": {"id": "999"}}})
+
+    client = MondayClient(api_token="token", session=session)
+    item_id = client.update_student_columns(
+        18413873041, "999",
+        {"numeric_mm4cpxr0": 12, "date_mm4cgyym": {"date": "2026-09-13"}, "text_mm5g2f0e": "Jane", "skip_me": None},
+    )
+
+    assert item_id == "999"
+    sent_body = session.post.call_args.kwargs["json"]
+    assert sent_body["variables"]["boardId"] == "18413873041"
+    assert sent_body["variables"]["itemId"] == "999"
+    assert "skip_me" not in sent_body["variables"]["columnValues"]
+    assert "Jane" in sent_body["variables"]["columnValues"]
+    assert "change_multiple_column_values" in sent_body["query"]
