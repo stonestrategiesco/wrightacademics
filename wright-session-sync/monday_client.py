@@ -149,6 +149,17 @@ class MondayClient:
                 ids.add(value)
         return ids
 
+    def get_items(self, board_id, column_ids):
+        """Read-only: return every item on a board with the given columns'
+        text values, as a list of {'item_id': ..., 'columns': {col_id: text}}.
+        Used for diagnostics that need more than one column per item (e.g.
+        the dedup diagnostic); makes no writes of any kind."""
+        results = []
+        for item in self._iter_board_items(board_id, column_ids):
+            columns = {column_id: self._column_text(item, column_id) for column_id in column_ids}
+            results.append({"item_id": item["id"], "columns": columns})
+        return results
+
     def get_student_lookup(self, board_id, teachworks_id_column):
         """Return {teachworks_student_id (str): monday_item_id (str)} for every
         Student item that has a Teachworks Student ID populated."""

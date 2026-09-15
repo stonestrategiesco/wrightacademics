@@ -289,6 +289,117 @@ def diagnose_teachworks_pagination(tw_client, status="Attended", per_page=100, m
     print("=" * 70)
 
 
+# Columns read for the dedup diagnostic: the production unique-ID column
+# plus secondary fields (NEVER used for production deduplication decisions -
+# the unique key is the only production key).
+_DEDUP_DIAGNOSTIC_COLUMNS = [
+    config.COL_UNIQUE_ID,
+    config.COL_SESSION_DATE,
+    config.COL_TEACHWORKS_STUDENT_ID,
+    config.COL_STUDENT_NAME,
+    config.COL_TUTOR,
+    config.COL_SERVICE,
+]
+
+
+def _find_likely_secondary_matches(session, monday_items, limit=5):
+    """Best-effort, READ-ONLY secondary match on session date + Teachworks
+    student ID (falling back to date + tutor/service). Diagnostic only -
+    never used to decide production deduplication."""
+    matches = []
+    session_date = session.get("session_date")
+    student_id_str = str(session.get("student_id")) if session.get("student_id") is not None else None
+
+    for item in monday_items:
+        cols = item["columns"]
+        if session_date and cols.get(config.COL_SESSION_DATE) != session_date:
+            continue
+        same_student = bool(student_id_str) and cols.get(config.COL_TEACHWORKS_STUDENT_ID) == student_id_str
+        same_tutor_or_service = (
+            (session.get("tutor") and cols.get(config.COL_TUTOR) == session.get("tutor"))
+            or (session.get("service") and cols.get(config.COL_SERVICE) == session.get("service"))
+        )
+        if same_student or same_tutor_or_service:
+            matches.append(item)
+        if len(matches) >= limit:
+            break
+    return matches
+
+
+def diagnose_dedup(tw_client, monday_client, start_date, end_date):
+    """Read-only: investigates why production deduplication saw zero exact
+    unique-key matches despite thousands of existing Monday Session Log
+    records. Computes the unique key for every Teachworks participant
+    session in the range exactly as production does, compares it against
+    what's actually stored in Monday's unique-ID column, and — for
+    unmatched sessions only — attempts a READ-ONLY secondary-field
+    comparison (session date, Teachworks student ID, tutor, service) purely
+    to investigate whether the old process used a different key format.
+    Secondary fields are never used to decide production deduplication.
+    Makes ZERO Monday writes."""
+    print("=" * 70)
+    print("DEDUPLICATION DIAGNOSTIC (read-only, zero Monday writes)")
+    print(f"Date range: {start_date} .. {end_date}")
+    print("=" * 70)
+
+    lessons = tw_client.get_lessons(start_date, end_date)
+    sessions = tw_client.extract_attended_sessions(lessons)
+
+    monday_items = monday_client.get_items(config.MONDAY_SESSIONS_BOARD_ID, _DEDUP_DIAGNOSTIC_COLUMNS)
+
+    existing_unique_keys = {
+        item["columns"].get(config.COL_UNIQUE_ID)
+        for item in monday_items
+        if item["columns"].get(config.COL_UNIQUE_ID)
+    }
+
+    exact_matches = 0
+    unmatched_sessions = []
+    for session in sessions:
+        if session["unique_key"] in existing_unique_keys:
+            exact_matches += 1
+        else:
+            unmatched_sessions.append(session)
+
+    print(f"Teachworks participant sessions: {len(sessions)}")
+    print(f"Exact unique-key matches: {exact_matches}")
+    print(f"No unique-key match: {len(unmatched_sessions)}")
+
+    print("\n" + "-" * 70)
+    print(f"READ-ONLY secondary-field comparison for the first 10 of {len(unmatched_sessions)} unmatched sessions")
+    print("(diagnostic only - NEVER used for production deduplication):")
+    print("-" * 70)
+
+    for session in unmatched_sessions[:10]:
+        print(f"\nTeachworks lesson ID: {session['lesson_id']}")
+        print(f"Teachworks student ID: {session['student_id']}")
+        print(f"Expected new unique key: {session['unique_key']}")
+
+        likely_matches = _find_likely_secondary_matches(session, monday_items)
+        if not likely_matches:
+            print("  No likely match found on session date + student ID/tutor/service.")
+            continue
+        for match in likely_matches:
+            cols = match["columns"]
+            print(f"  Existing Monday item ID: {match['item_id']}")
+            print(f"  Existing Monday unique-ID value: {cols.get(config.COL_UNIQUE_ID) or '(blank)'}")
+            print(f"  Session date: {cols.get(config.COL_SESSION_DATE) or '(blank)'}")
+
+    print("\n" + "-" * 70)
+    print(f"Sample of up to 10 nonblank existing {config.COL_UNIQUE_ID} values on the board:")
+    sample = [v for v in existing_unique_keys if v][:10]
+    if sample:
+        for value in sample:
+            print(f"  {value}")
+    else:
+        print("  (no nonblank values found on the board)")
+
+    print("\n" + "=" * 70)
+    print("DIAGNOSTIC COMPLETE - read-only. Zero Monday writes were made.")
+    print("=" * 70)
+    return 0
+
+
 def print_report(report):
     verb_created = "Sessions that WOULD be created" if report.mode.startswith("DRY RUN") else "Sessions created"
     lines = [
@@ -362,6 +473,7 @@ def main(argv=None):
     parser.add_argument("--lookback-days", type=int, default=None, help="Override LOOKBACK_DAYS for this run.")
     parser.add_argument("--dump-sample", action="store_true", help="Print one raw Teachworks lesson JSON and exit (for verifying field names).")
     parser.add_argument("--diagnose-teachworks", action="store_true", help="Read-only: test several /lessons query variants and print status/record counts. Makes zero Monday.com calls and zero writes.")
+    parser.add_argument("--diagnose-dedup", action="store_true", help="Read-only: compare computed unique keys against Monday's stored unique-ID column to investigate duplicate-detection results. Reads Monday.com but makes zero writes.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (default INFO).")
     args = parser.parse_args(argv)
 
@@ -403,6 +515,9 @@ def main(argv=None):
         max_retries=config.MAX_RETRIES,
         retry_base_delay=config.RETRY_BASE_DELAY_SECONDS,
     )
+
+    if args.diagnose_dedup:
+        return diagnose_dedup(tw_client, monday_client, start_date, end_date)
 
     mode = "FULL RECONCILIATION" if args.full else "SCHEDULED (rolling lookback)"
     if args.dry_run:

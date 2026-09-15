@@ -41,6 +41,41 @@ def test_get_existing_unique_ids_paginates_fully():
     assert session.post.call_count == 2
 
 
+def test_get_items_returns_multiple_columns_per_item_and_paginates():
+    session = MagicMock()
+    session.post.side_effect = [
+        _response(200, _items_page(
+            [{
+                "id": "1", "name": "a",
+                "column_values": [
+                    {"id": "uid", "text": "111_1", "value": None},
+                    {"id": "date", "text": "2026-09-13", "value": None},
+                ],
+            }],
+            cursor="cursor-1",
+        )),
+        _response(200, _next_items_page(
+            [{
+                "id": "2", "name": "b",
+                "column_values": [
+                    {"id": "uid", "text": "", "value": None},
+                    {"id": "date", "text": "2026-09-14", "value": None},
+                ],
+            }],
+            cursor=None,
+        )),
+    ]
+
+    client = MondayClient(api_token="token", session=session)
+    items = client.get_items(18423473385, ["uid", "date"])
+
+    assert session.post.call_count == 2
+    assert items == [
+        {"item_id": "1", "columns": {"uid": "111_1", "date": "2026-09-13"}},
+        {"item_id": "2", "columns": {"uid": "", "date": "2026-09-14"}},
+    ]
+
+
 def test_get_student_lookup_paginates_fully_and_skips_blank_ids():
     session = MagicMock()
     session.post.side_effect = [

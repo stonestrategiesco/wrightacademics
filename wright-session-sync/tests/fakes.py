@@ -17,9 +17,11 @@ class FakeTeachworksClient(TeachworksClient):
 
 
 class FakeMondayClient:
-    def __init__(self, existing_ids=None, student_lookup=None):
+    def __init__(self, existing_ids=None, student_lookup=None, items=None):
         self.existing_ids = set(existing_ids or [])
         self.student_lookup = dict(student_lookup or {})
+        # items: list of {"item_id": ..., "columns": {col_id: text}}, used by get_items()
+        self.items = list(items or [])
         self.created_items = []
         self.connections = []
         self._next_item_id = 1000
@@ -55,12 +57,18 @@ class FakeMondayClient:
         self.connections.append((item_id, student_item_id))
         return item_id
 
+    def get_items(self, board_id, column_ids):
+        return [
+            {"item_id": item["item_id"], "columns": {col: item["columns"].get(col, "") for col in column_ids}}
+            for item in self.items
+        ]
+
 
 def make_lesson(lesson_id, session_date, participants, tutor="Jane Tutor", service="Math", location="Online", duration=60):
     return {
         "id": lesson_id,
-        "date": session_date,
-        "tutor_name": tutor,
+        "from_date": session_date,
+        "employee_name": tutor,
         "service_name": service,
         "location_name": location,
         "duration": duration,

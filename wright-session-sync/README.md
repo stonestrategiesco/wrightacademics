@@ -141,7 +141,41 @@ fetched, total lessons seen, and the earliest/latest `from_date` across all
 of them — without printing every individual lesson. This shows the full
 extent of what this credential can actually see.
 
-## 4. Dry run (no writes — safe to run anytime)
+## 4. Investigating zero (or unexpected) duplicate-detection results
+
+```bash
+python sync.py --diagnose-dedup --lookback-days 2
+```
+
+Read-only — makes **zero Monday writes**, though unlike the two diagnostics
+above it does read from Monday.com (it needs to see the existing unique-ID
+column). Use this if a dry run or real sync reports far fewer duplicate
+skips than you'd expect given how many Session Log records already exist.
+
+It computes the unique key for every Teachworks participant session in the
+range exactly as production does, compares it against every non-blank value
+actually stored in Monday's `text_mm5h9n9g` column, and reports:
+
+```
+Teachworks participant sessions: <n>
+Exact unique-key matches: <n>
+No unique-key match: <n>
+```
+
+For the first 10 sessions with no exact match, it attempts a **read-only,
+diagnostic-only** secondary comparison against existing Monday records using
+session date + Teachworks Student ID (falling back to tutor/service), and
+prints any likely match's Monday item ID, its stored unique-ID value, and
+its session date — so you can see whether the old Zap stored a different
+key format, stored no key at all, or whether these are genuinely new
+sessions it never created. It also prints a sample of up to 10 non-blank
+existing unique-ID values so you can see their actual format.
+
+These secondary fields are **never** used to decide production
+deduplication — only the exact unique-key match is. This diagnostic exists
+purely to investigate, not to change, dedup behavior.
+
+## 5. Dry run (no writes — safe to run anytime)
 
 ```bash
 python sync.py --dry-run
@@ -178,7 +212,7 @@ RESULT: COMPLETED - all sessions synced, but some student connections need atten
 ======================================================================
 ```
 
-## 5. Normal sync (writes to Monday)
+## 6. Normal sync (writes to Monday)
 
 ```bash
 python sync.py
@@ -188,7 +222,7 @@ Checks the last `LOOKBACK_DAYS` days (default 3) and creates any missing
 Session Log items. Safe to run repeatedly — this is what the nightly
 schedule runs.
 
-## 6. Full reconciliation
+## 7. Full reconciliation
 
 ```bash
 python sync.py --full
@@ -240,7 +274,7 @@ real credentials required. They cover:
 
 ---
 
-## 7. Deploying to Railway
+## 8. Deploying to Railway
 
 1. Push this repository to GitHub (see below).
 2. In Railway: **New Project → Deploy from GitHub repo**, select this repo.
@@ -253,7 +287,7 @@ real credentials required. They cover:
 5. Under **Settings → Build**, Railway will run `pip install -r requirements.txt`
    automatically (Nixpacks detects `requirements.txt`).
 
-## 8. Configuring the nightly schedule
+## 9. Configuring the nightly schedule
 
 Railway supports **Cron Schedules** on a service:
 
@@ -270,7 +304,7 @@ Railway supports **Cron Schedules** on a service:
 Do **not** put `--full` in the scheduled command — that's for manual,
 occasional reconciliation only.
 
-## 9. Inspecting logs
+## 10. Inspecting logs
 
 Every run prints a plain-text report (see the dry-run example above) plus
 line-by-line logs for anything notable (`MISSING_STUDENT`, `CREATE_ERROR`,
@@ -285,7 +319,7 @@ tells you at a glance whether the run needs attention:
 A non-developer can read that one line to know whether the night's sync was
 clean.
 
-## 10. Giving / revoking developer access later
+## 11. Giving / revoking developer access later
 
 This integration is just a GitHub repo plus a Railway project — both owned
 by whichever GitHub/Railway account Wright Academics controls.
