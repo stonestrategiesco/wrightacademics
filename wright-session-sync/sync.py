@@ -1079,6 +1079,192 @@ def diagnose_checkpoint_migration_readiness(monday_client, sample_size=5):
     return 0
 
 
+# Exact titles of the two new columns the baseline+SET migration needs.
+# Neither exists yet - config.STUDENT_COL_HISTORICAL_BASELINE and
+# config.COL_PRE_BASELINE stay None until a human creates these columns in
+# Monday and this diagnostic reports their real IDs.
+_BASELINE_MIGRATION_COLUMNS_OF_INTEREST = [
+    ("Historical Session Baseline", "Students", "Numbers"),
+    ("Pre-Baseline", "Session Log", "Checkbox"),
+]
+
+
+def diagnose_baseline_migration_columns(monday_client):
+    """Stage 1, read-only: searches the Students board and the Session Log
+    board for the two new columns the baseline+SET migration needs
+    (Historical Session Baseline, Pre-Baseline) by exact title match, and
+    reports their real column IDs if found. If either column is missing,
+    prints the exact board/name/type a human needs to create manually in
+    Monday first - never guesses an ID. Makes ZERO Monday writes."""
+    print("=" * 70)
+    print("BASELINE MIGRATION COLUMN DIAGNOSTIC (read-only, zero Monday writes)")
+    print("=" * 70)
+
+    student_columns = monday_client.get_board_columns(config.MONDAY_STUDENTS_BOARD_ID)
+    session_columns = monday_client.get_board_columns(config.MONDAY_SESSIONS_BOARD_ID)
+    columns_by_board = {"Students": student_columns, "Session Log": session_columns}
+
+    all_found = True
+    for title, board_name, suggested_type in _BASELINE_MIGRATION_COLUMNS_OF_INTEREST:
+        columns = columns_by_board[board_name]
+        by_title = {(c.get("title") or "").strip().lower(): c for c in columns}
+        match = by_title.get(title.strip().lower())
+        print(f"\nBoard: {board_name}")
+        print(f"Column name: {title!r}")
+        if match:
+            print(f"  FOUND -> id={match['id']}  type={match['type']}")
+        else:
+            all_found = False
+            print("  NOT FOUND. Create it manually in Monday first:")
+            print(f"    Board: {board_name}")
+            print(f"    Column name: {title}")
+            print(f"    Column type: {suggested_type}")
+
+    print("\n" + "=" * 70)
+    if all_found:
+        print("Both columns found. Fill their real IDs into config.py:")
+        print("  STUDENT_COL_HISTORICAL_BASELINE, COL_PRE_BASELINE")
+    else:
+        print("One or more columns are missing. Create them in Monday, then re-run this diagnostic.")
+    print("DIAGNOSTIC COMPLETE - read-only. Zero Monday writes were made.")
+    print("=" * 70)
+    return 0
+
+
+def diagnose_baseline_migration(monday_client, sample_size=10):
+    """Stage 2, read-only migration dry run for the baseline+SET
+    architecture. Reports exactly what a real migration WOULD write on both
+    the Students board (Historical Session Baseline) and the Session Log
+    board (Pre-Baseline), without writing anything. Refuses to run (prints
+    an error, returns 1) if the two new column IDs haven't been filled into
+    config.py yet - never guesses them.
+
+    This function does not decide or enforce the migration cutover boundary
+    (which Session Log item IDs are frozen into the pre-baseline set) - it
+    reports the board state as read in this single pass, which is exactly
+    why that boundary must be established by a separate, explicit freeze
+    step before any migration write code is built. See the accompanying
+    investigation for that design."""
+    if config.STUDENT_COL_HISTORICAL_BASELINE is None or config.COL_PRE_BASELINE is None:
+        print("ERROR: --diagnose-baseline-migration requires both new column IDs to be configured first.")
+        print("  config.STUDENT_COL_HISTORICAL_BASELINE and config.COL_PRE_BASELINE are still None.")
+        print("  Run --diagnose-baseline-migration-columns, create the columns in Monday if needed,")
+        print("  then fill their real IDs into config.py before running this migration dry run.")
+        return 1
+
+    print("=" * 70)
+    print("BASELINE MIGRATION DRY RUN (read-only, zero Monday writes)")
+    print("=" * 70)
+
+    student_columns = [
+        config.STUDENT_BOARD_COL_TEACHWORKS_ID,
+        config.STUDENT_COL_SESSION_COUNT,
+        config.STUDENT_COL_HISTORICAL_BASELINE,
+    ]
+    session_columns = [
+        config.COL_UNIQUE_ID,
+        config.COL_TEACHWORKS_STUDENT_ID,
+        config.COL_PRE_BASELINE,
+    ]
+    student_items = monday_client.get_items(config.MONDAY_STUDENTS_BOARD_ID, student_columns)
+    session_items = monday_client.get_items(config.MONDAY_SESSIONS_BOARD_ID, session_columns)
+
+    # --- STUDENTS ---
+    students_evaluated = len(student_items)
+    with_count = 0
+    without_count = 0
+    already_baselined = 0
+    would_receive_baseline = []
+    for item in student_items:
+        cols = item["columns"]
+        count_raw = (cols.get(config.STUDENT_COL_SESSION_COUNT) or "").strip()
+        try:
+            count = int(count_raw)
+            with_count += 1
+        except ValueError:
+            count = 0
+            without_count += 1
+
+        baseline_raw = (cols.get(config.STUDENT_COL_HISTORICAL_BASELINE) or "").strip()
+        if baseline_raw:
+            already_baselined += 1
+        else:
+            would_receive_baseline.append({
+                "item_id": item["item_id"],
+                "student_name": item.get("item_name") or "",
+                "current_count": count_raw or "(blank)",
+                "proposed_baseline": count,
+            })
+
+    print("\n--- STUDENTS ---")
+    print(f"Students evaluated: {students_evaluated}")
+    print(f"Students with current Session Count: {with_count}")
+    print(f"Students with blank/null Session Count: {without_count}")
+    print(f"Students whose Historical Session Baseline is already populated: {already_baselined}")
+    print(f"Students that WOULD receive a baseline: {len(would_receive_baseline)}")
+
+    if would_receive_baseline:
+        print(f"\nSample (first {min(sample_size, len(would_receive_baseline))} of {len(would_receive_baseline)}):")
+        print(f"{'Student':<30}  {'Current Session Count':<22}  Proposed Historical Baseline")
+        for row in would_receive_baseline[:sample_size]:
+            print(f"{row['student_name']:<30}  {str(row['current_count']):<22}  {row['proposed_baseline']}")
+
+    # --- SESSION LOG ---
+    rows_evaluated = len(session_items)
+    already_pre_baseline = 0
+    would_be_marked = []
+    missing_student_id = 0
+    missing_unique_key = 0
+    seen_unique_keys = {}
+    for item in session_items:
+        cols = item["columns"]
+        unique_key = (cols.get(config.COL_UNIQUE_ID) or "").strip()
+        tw_student_id = (cols.get(config.COL_TEACHWORKS_STUDENT_ID) or "").strip()
+        pre_baseline_raw = (cols.get(config.COL_PRE_BASELINE) or "").strip()
+
+        if not tw_student_id:
+            missing_student_id += 1
+        if not unique_key:
+            missing_unique_key += 1
+        else:
+            seen_unique_keys.setdefault(unique_key, []).append(item["item_id"])
+
+        if pre_baseline_raw:
+            already_pre_baseline += 1
+        else:
+            would_be_marked.append({
+                "item_id": item["item_id"],
+                "item_name": item.get("item_name") or "",
+                "unique_key": unique_key or "(blank)",
+                "teachworks_student_id": tw_student_id or "(blank)",
+            })
+
+    duplicate_unique_keys = {key: ids for key, ids in seen_unique_keys.items() if len(ids) > 1}
+
+    print("\n--- SESSION LOG ---")
+    print(f"Session Log rows evaluated: {rows_evaluated}")
+    print(f"Rows already marked Pre-Baseline: {already_pre_baseline}")
+    print(f"Rows that WOULD be marked Pre-Baseline: {len(would_be_marked)}")
+    print(f"Duplicate unique identities detected: {len(duplicate_unique_keys)}")
+    for key, ids in sorted(duplicate_unique_keys.items()):
+        print(f"  unique_key={key}  item_ids={ids}")
+    print(f"Rows missing Teachworks Student ID: {missing_student_id}")
+    print(f"Rows missing unique_key: {missing_unique_key}")
+
+    if would_be_marked:
+        print(f"\nSample (first {min(sample_size, len(would_be_marked))} of {len(would_be_marked)}):")
+        print(f"{'Item ID':<10}  {'Item Name':<30}  {'Unique Key':<20}  Teachworks Student ID")
+        for row in would_be_marked[:sample_size]:
+            print(f"{row['item_id']:<10}  {row['item_name']:<30}  {row['unique_key']:<20}  {row['teachworks_student_id']}")
+
+    print("\n" + "=" * 70)
+    print("DIAGNOSTIC COMPLETE - read-only. Zero Monday writes were made.")
+    print("This is NOT the migration cutover: see the accompanying freeze-boundary design")
+    print("before any migration write code is built.")
+    print("=" * 70)
+    return 0
+
+
 def run_student_rollup_dry_run(monday_client, today=None):
     """Stage 2, combined dry run: runs the real rollup calculation
     (compute_student_rollup_updates) and reports it. Makes ZERO Monday
@@ -1223,6 +1409,8 @@ def main(argv=None):
     parser.add_argument("--diagnose-student-rollup-delta", action="store_true", help="Read-only: validate a baseline+delta rollup approach for students whose current Session Data Last Synced equals --baseline-date. Reads Monday.com but makes zero writes.")
     parser.add_argument("--baseline-date", default=None, help="YYYY-MM-DD baseline date, required by --diagnose-student-rollup-delta.")
     parser.add_argument("--diagnose-checkpoint-migration", action="store_true", help="Read-only: inspect the Session Data Last Synced column's settings and a sample of Session Log items' created_at, ahead of any datetime-checkpoint migration. Reads Monday.com but makes zero writes.")
+    parser.add_argument("--diagnose-baseline-migration-columns", action="store_true", help="Read-only: search the Students and Session Log boards for the Historical Session Baseline / Pre-Baseline columns needed by the baseline+SET migration, and report their real IDs if found. Reads Monday.com but makes zero writes.")
+    parser.add_argument("--diagnose-baseline-migration", action="store_true", help="Read-only: full migration dry run for the baseline+SET architecture (Students Historical Session Baseline, Session Log Pre-Baseline). Requires config.STUDENT_COL_HISTORICAL_BASELINE / config.COL_PRE_BASELINE to be set first. Reads Monday.com but makes zero writes.")
     parser.add_argument("--student-rollups", action="store_true", help="Calculate production-ready Student rollup updates (baseline+delta, per-student checkpoint). Combine with --dry-run to preview, or --apply to perform the real Monday writes.")
     parser.add_argument("--apply", action="store_true", help="Perform REAL Monday writes for --student-rollups. Writes never happen just because --dry-run is absent - --apply must be passed explicitly.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (default INFO).")
@@ -1281,6 +1469,12 @@ def main(argv=None):
 
     if args.diagnose_checkpoint_migration:
         return diagnose_checkpoint_migration_readiness(monday_client)
+
+    if args.diagnose_baseline_migration_columns:
+        return diagnose_baseline_migration_columns(monday_client)
+
+    if args.diagnose_baseline_migration:
+        return diagnose_baseline_migration(monday_client)
 
     if args.student_rollups:
         if args.apply and args.dry_run:

@@ -290,7 +290,70 @@ error is logged and the student is reported under "Failed writes"; every
 other student is still processed. The command exits 1 if any writes
 failed (so a scheduler/monitor can flag it), 0 otherwise.
 
-## 6. Investigating zero (or unexpected) duplicate-detection results
+## 6. Baseline+SET migration diagnostics (Stage 1/2 — read-only, no writes)
+
+The date-checkpoint rollup model above is being replaced by a **baseline +
+SET** model: each student gets an immutable `Historical Session Baseline`
+(a one-time snapshot of their lifetime count before migration), and future
+nightly runs compute `Session Count = Historical Session Baseline + count
+of distinct post-baseline Session Log identities`, then **SET** (never
+increment) the result. Session Log rows get an immutable `Pre-Baseline`
+flag marking which rows are already "inside" a student's baseline, so they
+are never double-counted by the post-baseline delta.
+
+Neither of these two commands writes to Monday. Neither the nightly rollup
+calculation nor `--daily-sync` has been changed to use this model yet —
+that is future work, gated on migration-boundary approval.
+
+### Stage 1 — discovering the two new column IDs
+
+```bash
+python sync.py --diagnose-baseline-migration-columns
+```
+
+Searches the Students board for a column titled exactly `Historical
+Session Baseline` and the Session Log board for one titled exactly
+`Pre-Baseline`. If either doesn't exist yet, it must be created manually
+in Monday first:
+
+| Board | Column name | Column type |
+|---|---|---|
+| Students | Historical Session Baseline | Numbers |
+| Session Log | Pre-Baseline | Checkbox |
+
+Once both exist, this diagnostic reports their real column IDs. Fill those
+into `config.STUDENT_COL_HISTORICAL_BASELINE` and `config.COL_PRE_BASELINE`
+(both `None` until then) — never guess these IDs.
+
+### Stage 2 — migration dry run
+
+```bash
+python sync.py --diagnose-baseline-migration
+```
+
+Refuses to run (prints an error, exits 1) until both column IDs above are
+configured. Once configured, reports — with **zero writes**:
+
+- **Students**: evaluated, with/without a current Session Count, how many
+  already have a Historical Session Baseline, how many would receive one,
+  and a sample of (student, current Session Count, proposed baseline).
+- **Session Log**: rows evaluated, already marked Pre-Baseline, how many
+  would be marked, duplicate unique identities (if any), rows missing a
+  Teachworks Student ID or a unique key, and a sample of rows that would be
+  marked.
+
+This dry run reads the boards in a single pass and is **not** the migration
+cutover itself — it does not freeze a boundary. Before any migration-apply
+code is written, the exact Session Log item IDs belonging to the
+pre-baseline set must be captured in one atomic read (e.g. record the
+highest existing Session Log item ID and the full board snapshot in the
+same pass used to compute each student's proposed baseline), so that every
+row in that frozen set gets `Pre-Baseline = Yes`, every row created after
+it stays blank, and each student's baseline matches their Session Count as
+of that exact same snapshot. That boundary design must be reviewed and
+approved before any real migration write exists.
+
+## 7. Investigating zero (or unexpected) duplicate-detection results
 
 ```bash
 python sync.py --diagnose-dedup --lookback-days 2
@@ -328,7 +391,7 @@ production deduplication — only the exact composite/legacy key match run
 by `run_sync()` is. This diagnostic exists purely to investigate, not to
 change, dedup behavior.
 
-## 7. Dry run (no writes — safe to run anytime)
+## 8. Dry run (no writes — safe to run anytime)
 
 ```bash
 python sync.py --dry-run
@@ -365,7 +428,7 @@ RESULT: COMPLETED - all sessions synced, but some student connections need atten
 ======================================================================
 ```
 
-## 8. Normal sync (writes to Monday)
+## 9. Normal sync (writes to Monday)
 
 ```bash
 python sync.py
@@ -375,7 +438,7 @@ Checks the last `LOOKBACK_DAYS` days (default 3) and creates any missing
 Session Log items. Safe to run repeatedly — this is what the nightly
 schedule runs.
 
-## 9. Full reconciliation
+## 10. Full reconciliation
 
 ```bash
 python sync.py --full
@@ -427,7 +490,7 @@ real credentials required. They cover:
 
 ---
 
-## 10. Deploying to Railway
+## 11. Deploying to Railway
 
 1. Push this repository to GitHub (see below).
 2. In Railway: **New Project → Deploy from GitHub repo**, select this repo.
@@ -440,7 +503,7 @@ real credentials required. They cover:
 5. Under **Settings → Build**, Railway will run `pip install -r requirements.txt`
    automatically (Nixpacks detects `requirements.txt`).
 
-## 11. Configuring the nightly schedule
+## 12. Configuring the nightly schedule
 
 Railway supports **Cron Schedules** on a service:
 
@@ -457,7 +520,7 @@ Railway supports **Cron Schedules** on a service:
 Do **not** put `--full` in the scheduled command — that's for manual,
 occasional reconciliation only.
 
-## 12. Inspecting logs
+## 13. Inspecting logs
 
 Every run prints a plain-text report (see the dry-run example above) plus
 line-by-line logs for anything notable (`MISSING_STUDENT`, `CREATE_ERROR`,
@@ -472,7 +535,7 @@ tells you at a glance whether the run needs attention:
 A non-developer can read that one line to know whether the night's sync was
 clean.
 
-## 13. Giving / revoking developer access later
+## 14. Giving / revoking developer access later
 
 This integration is just a GitHub repo plus a Railway project — both owned
 by whichever GitHub/Railway account Wright Academics controls.
