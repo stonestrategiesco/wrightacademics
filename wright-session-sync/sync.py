@@ -2001,6 +2001,136 @@ def run_post_baseline_rollup_dry_run(monday_client, sample_size=25):
     return 0
 
 
+def apply_post_baseline_student_rollup_updates(monday_client):
+    """Performs the REAL Monday writes for the baseline+SET rollup
+    calculated by compute_post_baseline_student_rollup_updates() - reused
+    exactly as-is, no second calculation path. Unmatched students (blank
+    Teachworks Student ID) receive no write.
+
+    Only writes a student whose calculated Session Count, Last Session
+    Date, or Tutor differs from what is currently stored - a student
+    whose calculated values already match Monday is skipped entirely with
+    no write. Combined with Session Count always being freshly
+    recalculated (never incremented) and Last Session Date/Tutor already
+    only ever moving forward (guaranteed by
+    compute_post_baseline_student_rollup_updates, not by this function),
+    this is what makes the command safe to run repeatedly: re-running it
+    against unchanged Monday data always produces zero writes.
+
+    Session Count, Last Session Date, and Tutor are written together in
+    ONE change_multiple_column_values mutation per student, so a failed
+    write leaves all three completely unchanged for that student. First
+    Session Date and Session Data Last Synced are never included in the
+    write - reuses _real_or_none() (already used by the date-checkpoint
+    path) to translate the '(blank)' display sentinel back to None rather
+    than ever writing that literal string.
+
+    One student's write failure is logged and does NOT stop the remaining
+    students from being processed.
+
+    Returns a dict of {results, written, unchanged, skipped_unmatched,
+    failed}. Does not call or modify run_sync(), Teachworks retrieval,
+    Session Log creation/dedup/connection logic,
+    _group_session_log_rows_by_student(),
+    compute_student_rollup_updates(), apply_baseline_migration(), or
+    _canonical_session_identity()/_group_post_baseline_session_log_rows_by_student()."""
+    outcome = compute_post_baseline_student_rollup_updates(monday_client)
+    results = outcome["results"]
+
+    written = []
+    unchanged = []
+    skipped_unmatched = []
+    failed = []
+
+    for r in results:
+        if not r["matched"]:
+            skipped_unmatched.append(r)
+            continue
+
+        differs = (
+            r["proposed_count"] != r["current_count"]
+            or r["proposed_last_session"] != r["current_last_session"]
+            or r["proposed_tutor"] != r["current_tutor"]
+        )
+        if not differs:
+            unchanged.append(r)
+            continue
+
+        last_session = _real_or_none(r["proposed_last_session"])
+        column_values = {
+            config.STUDENT_COL_SESSION_COUNT: r["proposed_count"],
+            config.STUDENT_COL_LAST_SESSION_DATE: {"date": last_session} if last_session else None,
+            config.STUDENT_COL_TUTOR: _real_or_none(r["proposed_tutor"]),
+        }
+        try:
+            monday_client.update_student_columns(config.MONDAY_STUDENTS_BOARD_ID, r["monday_item_id"], column_values)
+        except Exception as exc:  # noqa: BLE001 - one bad student must not stop the run
+            logger.error(
+                "POST_BASELINE_ROLLUP_WRITE_ERROR monday_item_id=%s teachworks_student_id=%s error=%s",
+                r["monday_item_id"], r["teachworks_student_id"], exc,
+            )
+            failed.append({**r, "error": str(exc)})
+            continue
+
+        written.append(r)
+
+    return {
+        "results": results,
+        "written": written,
+        "unchanged": unchanged,
+        "skipped_unmatched": skipped_unmatched,
+        "failed": failed,
+    }
+
+
+def run_post_baseline_rollup_apply(monday_client):
+    """CLI-facing: applies REAL Monday writes for the baseline+SET student
+    rollup and reports the outcome. Only reachable via
+    --post-baseline-rollups --apply."""
+    print("=" * 70)
+    print("POST-BASELINE STUDENT ROLLUP - APPLYING WRITES (REAL Monday writes)")
+    print("=" * 70)
+
+    outcome = apply_post_baseline_student_rollup_updates(monday_client)
+
+    if outcome["written"]:
+        print(f"\nWrites performed: {len(outcome['written'])}")
+        for r in sorted(outcome["written"], key=lambda r: r["student_name"]):
+            print(
+                f"  {r['student_name']} (item {r['monday_item_id']}): "
+                f"count {r['current_count']} -> {r['proposed_count']}, "
+                f"last session {r['current_last_session']} -> {r['proposed_last_session']}, "
+                f"tutor {r['current_tutor']} -> {r['proposed_tutor']}"
+            )
+
+    if outcome["skipped_unmatched"]:
+        print(f"\nSkipped (cannot be matched, no write): {len(outcome['skipped_unmatched'])}")
+        for r in sorted(outcome["skipped_unmatched"], key=lambda r: r["student_name"]):
+            print(f"  Monday item {r['monday_item_id']} ({r['student_name']}): no Teachworks Student ID")
+
+    if outcome["failed"]:
+        print(f"\nFAILED writes: {len(outcome['failed'])}")
+        for r in sorted(outcome["failed"], key=lambda r: r["student_name"]):
+            print(f"  {r['student_name']} (item {r['monday_item_id']}): {r['error']}")
+
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"Students evaluated: {len(outcome['results'])}")
+    print(f"Writes performed: {len(outcome['written'])}")
+    print(f"Already correct (no write needed): {len(outcome['unchanged'])}")
+    print(f"Skipped (cannot be matched): {len(outcome['skipped_unmatched'])}")
+    print(f"Failed writes: {len(outcome['failed'])}")
+
+    print("\n" + "=" * 70)
+    if outcome["failed"]:
+        print(f"FINAL RESULT: FAILED - {len(outcome['failed'])} write(s) failed. See above.")
+    else:
+        print("FINAL RESULT: SUCCESS - post-baseline rollup applied with zero failures.")
+    print("=" * 70)
+    return 1 if outcome["failed"] else 0
+
+
 def run_student_rollup_dry_run(monday_client, today=None):
     """Stage 2, combined dry run: runs the real rollup calculation
     (compute_student_rollup_updates) and reports it. Makes ZERO Monday
@@ -2150,7 +2280,7 @@ def main(argv=None):
     parser.add_argument("--diagnose-session-log-duplicates", action="store_true", help="Read-only: investigate duplicate Session Log unique identities in detail (exact duplicates and cross-format bare/composite key collisions), with full row detail and created_at. Reads Monday.com but makes zero writes.")
     parser.add_argument("--diagnose-baseline-migration-cutover", action="store_true", help="Read-only: one frozen-snapshot migration cutover preview (Students + Session Log), including an in-memory post-migration simulation proving post-baseline identities start at zero. Requires config.STUDENT_COL_HISTORICAL_BASELINE / config.COL_PRE_BASELINE to be set first. Reads Monday.com but makes zero writes.")
     parser.add_argument("--apply-baseline-migration", action="store_true", help="ONE-TIME REAL WRITE: applies the baseline+SET migration from one frozen Students + Session Log snapshot - sets each unmigrated student's Historical Session Baseline to their current Session Count, and marks each unmarked Session Log row in the snapshot Pre-Baseline = Yes. Never touches Session Count or any other existing field. Safe to re-run (already-migrated items are skipped). Requires config.STUDENT_COL_HISTORICAL_BASELINE / config.COL_PRE_BASELINE to be set first.")
-    parser.add_argument("--post-baseline-rollups", action="store_true", help="Calculate the baseline+SET student rollup (Session Count = Historical Session Baseline + distinct post-baseline Session Log identities). Only --dry-run is implemented so far; --apply is not yet built.")
+    parser.add_argument("--post-baseline-rollups", action="store_true", help="Calculate the baseline+SET student rollup (Session Count = Historical Session Baseline + distinct post-baseline Session Log identities). Combine with --dry-run to preview, or --apply to perform the real Monday writes.")
     parser.add_argument("--student-rollups", action="store_true", help="Calculate production-ready Student rollup updates (baseline+delta, per-student checkpoint). Combine with --dry-run to preview, or --apply to perform the real Monday writes.")
     parser.add_argument("--apply", action="store_true", help="Perform REAL Monday writes for --student-rollups. Writes never happen just because --dry-run is absent - --apply must be passed explicitly.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (default INFO).")
@@ -2226,12 +2356,14 @@ def main(argv=None):
         return run_baseline_migration_apply(monday_client)
 
     if args.post_baseline_rollups:
-        if args.apply:
-            print("ERROR: --post-baseline-rollups --apply is not yet implemented. Only --dry-run is available.")
+        if args.apply and args.dry_run:
+            print("ERROR: Pass either --dry-run or --apply for --post-baseline-rollups, not both.")
             return 1
+        if args.apply:
+            return run_post_baseline_rollup_apply(monday_client)
         if args.dry_run:
             return run_post_baseline_rollup_dry_run(monday_client)
-        print("ERROR: --post-baseline-rollups requires --dry-run (the only mode currently implemented).")
+        print("ERROR: --post-baseline-rollups requires either --dry-run (preview) or --apply (real writes).")
         return 1
 
     if args.student_rollups:

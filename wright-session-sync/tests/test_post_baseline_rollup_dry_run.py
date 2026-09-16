@@ -272,26 +272,7 @@ def test_cli_wires_dry_run_flag(monkeypatch):
     assert monday.student_updates == []
 
 
-def test_cli_refuses_apply_since_it_is_not_yet_implemented(monkeypatch, capsys):
-    import config as config_module
-    import sync
-
-    monkeypatch.setattr(config_module, "TEACHWORKS_API_KEY", "fake-key")
-    monkeypatch.setattr(config_module, "MONDAY_API_TOKEN", "fake-token")
-
-    monday = WriteGuardedMondayClient(student_items=[], items=[])
-    monkeypatch.setattr(sync, "TeachworksClient", lambda **kwargs: object())
-    monkeypatch.setattr(sync, "MondayClient", lambda **kwargs: monday)
-
-    exit_code = sync.main(["--post-baseline-rollups", "--apply"])
-
-    out = capsys.readouterr().out
-    assert exit_code == 1
-    assert "not yet implemented" in out
-    assert monday.student_updates == []
-
-
-def test_cli_requires_dry_run_flag(monkeypatch, capsys):
+def test_cli_requires_dry_run_or_apply_flag(monkeypatch, capsys):
     import config as config_module
     import sync
 
@@ -306,4 +287,4 @@ def test_cli_requires_dry_run_flag(monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert exit_code == 1
-    assert "requires --dry-run" in out
+    assert "requires either --dry-run" in out
