@@ -81,21 +81,11 @@ STUDENT_COL_MILESTONES = "color_mm4c964d"
 # ---------------------------------------------------------------------------
 # Baseline + SET migration (new architecture, not yet built)
 # ---------------------------------------------------------------------------
-# PENDING MIGRATION SETUP: these two columns do not exist yet. Create them
-# manually in Monday first (see README), then run
-# `sync.py --diagnose-baseline-migration-columns` to get their real IDs and
-# fill them in here. Do NOT guess - the migration diagnostics refuse to run
-# while either of these is None.
-#
-#   Board: Students (18413873041)
-#   Column name: "Historical Session Baseline"
-#   Column type: Numbers
-#
-#   Board: Session Log (18423473385)
-#   Column name: "Pre-Baseline"
-#   Column type: Checkbox
-STUDENT_COL_HISTORICAL_BASELINE = None
-COL_PRE_BASELINE = None
+# Confirmed via `sync.py --diagnose-baseline-migration-columns` against the
+# real boards. No migration writes exist yet - these are read by
+# diagnose_baseline_migration() only.
+STUDENT_COL_HISTORICAL_BASELINE = "numeric_mm785914"
+COL_PRE_BASELINE = "boolean_mm78a02"
 
 
 def validate():
