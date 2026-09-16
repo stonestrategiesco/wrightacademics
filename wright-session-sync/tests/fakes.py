@@ -102,6 +102,18 @@ class FakeMondayClient:
             })
         return results
 
+    def get_items_with_created_at(self, board_id, column_ids):
+        source = self.student_items if board_id == config.MONDAY_STUDENTS_BOARD_ID else self.items
+        results = []
+        for item in source:
+            results.append({
+                "item_id": item["item_id"],
+                "item_name": item.get("item_name", ""),
+                "created_at": self.created_at_by_item_id.get(item["item_id"]),
+                "columns": {col: item["columns"].get(col, "") for col in column_ids},
+            })
+        return results
+
     def update_student_columns(self, board_id, item_id, column_values):
         if self.update_student_side_effect is not None:
             self.update_student_side_effect(item_id, column_values)

@@ -131,6 +131,35 @@ def test_get_sample_items_with_created_at_returns_created_at_per_item():
     assert request_variables["limit"] == 5
 
 
+def test_get_items_with_created_at_paginates_and_includes_created_at():
+    session = MagicMock()
+    session.post.side_effect = [
+        _response(200, _items_page(
+            [{
+                "id": "1", "name": "a", "created_at": "2026-09-15T18:30:00Z",
+                "column_values": [{"id": "uid", "text": "100_1", "value": None}],
+            }],
+            cursor="cursor-1",
+        )),
+        _response(200, _next_items_page(
+            [{
+                "id": "2", "name": "b", "created_at": "2026-09-16T09:00:00Z",
+                "column_values": [{"id": "uid", "text": "101_2", "value": None}],
+            }],
+            cursor=None,
+        )),
+    ]
+
+    client = MondayClient(api_token="token", session=session)
+    items = client.get_items_with_created_at(18423473385, ["uid"])
+
+    assert session.post.call_count == 2
+    assert items == [
+        {"item_id": "1", "item_name": "a", "created_at": "2026-09-15T18:30:00Z", "columns": {"uid": "100_1"}},
+        {"item_id": "2", "item_name": "b", "created_at": "2026-09-16T09:00:00Z", "columns": {"uid": "101_2"}},
+    ]
+
+
 def test_get_items_returns_multiple_columns_per_item_and_paginates():
     session = MagicMock()
     session.post.side_effect = [

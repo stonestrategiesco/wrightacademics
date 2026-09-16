@@ -1265,6 +1265,161 @@ def diagnose_baseline_migration(monday_client, sample_size=10):
     return 0
 
 
+_SESSION_LOG_DUPLICATE_INVESTIGATION_COLUMNS = [
+    config.COL_UNIQUE_ID,
+    config.COL_TEACHWORKS_STUDENT_ID,
+    config.COL_SESSION_DATE,
+    config.COL_TUTOR,
+]
+
+
+def _unique_key_format_and_lesson_id(unique_key):
+    """Classify a unique_key string as the composite format run_sync() writes
+    today ('{lesson_id}_{student_id}') or the bare legacy format the old
+    Zapier automation wrote, and pull out the shared lesson_id token either
+    way. Blank keys return (None, None)."""
+    if not unique_key:
+        return None, None
+    if "_" in unique_key:
+        lesson_id, _, _student_id = unique_key.rpartition("_")
+        return "composite", lesson_id
+    return "legacy_bare", unique_key
+
+
+def diagnose_session_log_duplicates(monday_client, sample_size=25):
+    """Read-only investigation of duplicate Session Log unique identities,
+    ahead of any baseline migration decision. Reports two DIFFERENT kinds
+    of duplication, since they have different implications for the
+    existing rollup dedup logic (_group_session_log_rows_by_student):
+
+    1. EXACT duplicates: two or more Monday items share the literal same
+       COL_UNIQUE_ID text (whatever its format). The current rollup grouping
+       already collapses these to one, since it dedupes by exact string
+       match before counting - but "more than one Monday item exists with
+       identical content" is still worth a human's eyes.
+
+    2. CROSS-FORMAT collisions: a bare legacy-format key (e.g. "89515688")
+       and a composite key sharing the same leading lesson_id token (e.g.
+       "89515688_2203327") appear as SEPARATE Monday items. These are NOT
+       caught by the exact-duplicate check above (different literal
+       strings) and are NOT collapsed by the current rollup dedup logic
+       either - each would be counted as its own distinct session. Whether
+       that's a real double-count depends on whether they represent the
+       SAME participant (same Teachworks Student ID) or genuinely different
+       participants in the same lesson; this diagnostic reports the
+       Teachworks Student ID column directly from each item (independent of
+       what's encoded in the key) so a human can judge that.
+
+    Makes ZERO Monday writes. Does not change dedup logic, rollup
+    calculation, or the Session Log sync pipeline in any way."""
+    print("=" * 70)
+    print("SESSION LOG DUPLICATE INVESTIGATION (read-only, zero Monday writes)")
+    print("=" * 70)
+
+    items = monday_client.get_items_with_created_at(
+        config.MONDAY_SESSIONS_BOARD_ID, _SESSION_LOG_DUPLICATE_INVESTIGATION_COLUMNS
+    )
+
+    def _row(item):
+        cols = item["columns"]
+        return {
+            "item_id": item["item_id"],
+            "item_name": item.get("item_name") or "",
+            "unique_key": cols.get(config.COL_UNIQUE_ID) or "",
+            "teachworks_student_id": cols.get(config.COL_TEACHWORKS_STUDENT_ID) or "",
+            "session_date": cols.get(config.COL_SESSION_DATE) or "",
+            "tutor": cols.get(config.COL_TUTOR) or "",
+            "created_at": item.get("created_at"),
+        }
+
+    rows = [_row(item) for item in items]
+
+    # --- 1. Exact duplicate unique keys -----------------------------------
+    by_unique_key = {}
+    for row in rows:
+        if row["unique_key"]:
+            by_unique_key.setdefault(row["unique_key"], []).append(row)
+    exact_duplicate_groups = {key: group for key, group in by_unique_key.items() if len(group) > 1}
+
+    print(f"\nSession Log rows evaluated: {len(rows)}")
+    print(f"Distinct non-blank unique keys: {len(by_unique_key)}")
+    print(f"Exact duplicate unique-key groups: {len(exact_duplicate_groups)}")
+
+    print("\n--- EXACT DUPLICATE UNIQUE KEYS ---")
+    if not exact_duplicate_groups:
+        print("None found.")
+    sorted_dup_keys = sorted(exact_duplicate_groups)
+    if len(sorted_dup_keys) > sample_size:
+        print(f"(showing first {sample_size} of {len(sorted_dup_keys)} groups)")
+    for key in sorted_dup_keys[:sample_size]:
+        group = exact_duplicate_groups[key]
+        key_format, lesson_id = _unique_key_format_and_lesson_id(key)
+        print(f"\nunique_key={key!r}  format={key_format}  derived_lesson_id={lesson_id}  ({len(group)} rows)")
+        print(f"  {'Item ID':<10}  {'Item Name':<28}  {'TW Student ID':<14}  {'Session Date':<13}  {'Tutor':<18}  Created At")
+        for row in group:
+            print(
+                f"  {row['item_id']:<10}  {row['item_name']:<28}  {row['teachworks_student_id']:<14}  "
+                f"{row['session_date']:<13}  {row['tutor']:<18}  {row['created_at']}"
+            )
+        distinct_student_ids = {row["teachworks_student_id"] for row in group}
+        if len(distinct_student_ids) > 1:
+            print(f"  NOTE: rows disagree on Teachworks Student ID ({sorted(distinct_student_ids)}) - investigate before assuming these are the same session.")
+
+    # --- 2. Cross-format lesson_id collisions -----------------------------
+    by_lesson_id = {}
+    for row in rows:
+        key_format, lesson_id = _unique_key_format_and_lesson_id(row["unique_key"])
+        if lesson_id is None:
+            continue
+        by_lesson_id.setdefault(lesson_id, []).append((key_format, row))
+
+    cross_format_groups = {}
+    for lesson_id, entries in by_lesson_id.items():
+        formats_present = {fmt for fmt, _row in entries}
+        if "legacy_bare" in formats_present and "composite" in formats_present:
+            cross_format_groups[lesson_id] = entries
+
+    print(f"\n--- CROSS-FORMAT LESSON ID COLLISIONS (bare legacy key + composite key sharing a lesson_id) ---")
+    print(f"Lesson IDs with both a legacy bare key and a composite key: {len(cross_format_groups)}")
+    sorted_cross_format_lesson_ids = sorted(cross_format_groups)
+    if len(sorted_cross_format_lesson_ids) > sample_size:
+        print(f"(showing first {sample_size} of {len(sorted_cross_format_lesson_ids)})")
+    same_student_by_lesson_id = {
+        lesson_id: len({row["teachworks_student_id"] for _fmt, row in entries}) == 1
+        for lesson_id, entries in cross_format_groups.items()
+    }
+    likely_true_duplicates = sum(1 for same_student in same_student_by_lesson_id.values() if same_student)
+    for lesson_id in sorted_cross_format_lesson_ids[:sample_size]:
+        entries = cross_format_groups[lesson_id]
+        same_student = same_student_by_lesson_id[lesson_id]
+        print(f"\nlesson_id={lesson_id}  ({len(entries)} rows, {'SAME' if same_student else 'DIFFERENT'} Teachworks Student ID across rows)")
+        print(f"  {'Item ID':<10}  {'Format':<12}  {'Unique Key':<20}  {'TW Student ID':<14}  {'Session Date':<13}  {'Tutor':<18}  Created At")
+        for fmt, row in entries:
+            print(
+                f"  {row['item_id']:<10}  {fmt:<12}  {row['unique_key']:<20}  {row['teachworks_student_id']:<14}  "
+                f"{row['session_date']:<13}  {row['tutor']:<18}  {row['created_at']}"
+            )
+        if same_student:
+            print("  LIKELY TRUE DUPLICATE: same lesson_id, same Teachworks Student ID, stored under two different key formats.")
+        else:
+            print("  LIKELY LEGITIMATE: same lesson, different participants - not a duplicate.")
+
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"Session Log rows evaluated: {len(rows)}")
+    print(f"Exact duplicate unique-key groups: {len(exact_duplicate_groups)}")
+    print(f"Cross-format lesson_id collisions: {len(cross_format_groups)}")
+    print(f"  of which same-student (likely true duplicate): {likely_true_duplicates}")
+    print(f"  of which different-student (likely legitimate multi-participant lesson): {len(cross_format_groups) - likely_true_duplicates}")
+
+    print("\n" + "=" * 70)
+    print("DIAGNOSTIC COMPLETE - read-only. Zero Monday writes were made.")
+    print("Nothing was deleted, archived, modified, or marked.")
+    print("=" * 70)
+    return 0
+
+
 def run_student_rollup_dry_run(monday_client, today=None):
     """Stage 2, combined dry run: runs the real rollup calculation
     (compute_student_rollup_updates) and reports it. Makes ZERO Monday
@@ -1411,6 +1566,7 @@ def main(argv=None):
     parser.add_argument("--diagnose-checkpoint-migration", action="store_true", help="Read-only: inspect the Session Data Last Synced column's settings and a sample of Session Log items' created_at, ahead of any datetime-checkpoint migration. Reads Monday.com but makes zero writes.")
     parser.add_argument("--diagnose-baseline-migration-columns", action="store_true", help="Read-only: search the Students and Session Log boards for the Historical Session Baseline / Pre-Baseline columns needed by the baseline+SET migration, and report their real IDs if found. Reads Monday.com but makes zero writes.")
     parser.add_argument("--diagnose-baseline-migration", action="store_true", help="Read-only: full migration dry run for the baseline+SET architecture (Students Historical Session Baseline, Session Log Pre-Baseline). Requires config.STUDENT_COL_HISTORICAL_BASELINE / config.COL_PRE_BASELINE to be set first. Reads Monday.com but makes zero writes.")
+    parser.add_argument("--diagnose-session-log-duplicates", action="store_true", help="Read-only: investigate duplicate Session Log unique identities in detail (exact duplicates and cross-format bare/composite key collisions), with full row detail and created_at. Reads Monday.com but makes zero writes.")
     parser.add_argument("--student-rollups", action="store_true", help="Calculate production-ready Student rollup updates (baseline+delta, per-student checkpoint). Combine with --dry-run to preview, or --apply to perform the real Monday writes.")
     parser.add_argument("--apply", action="store_true", help="Perform REAL Monday writes for --student-rollups. Writes never happen just because --dry-run is absent - --apply must be passed explicitly.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (default INFO).")
@@ -1475,6 +1631,9 @@ def main(argv=None):
 
     if args.diagnose_baseline_migration:
         return diagnose_baseline_migration(monday_client)
+
+    if args.diagnose_session_log_duplicates:
+        return diagnose_session_log_duplicates(monday_client)
 
     if args.student_rollups:
         if args.apply and args.dry_run:

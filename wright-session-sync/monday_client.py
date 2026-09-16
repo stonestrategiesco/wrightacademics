@@ -248,6 +248,75 @@ class MondayClient:
             })
         return results
 
+    def _iter_board_items_with_created_at(self, board_id, column_ids):
+        """Like _iter_board_items(), but each yielded item also carries
+        created_at. Deliberately a SEPARATE paginated iterator - not a
+        parameter added to _iter_board_items() - so the production sync
+        path and every diagnostic already built on _iter_board_items()
+        (get_existing_unique_ids, get_items, get_student_lookup) are
+        completely untouched. Makes no writes of any kind."""
+        query = """
+        query ($boardId: [ID!], $limit: Int, $columnIds: [String!]) {
+          boards(ids: $boardId) {
+            items_page(limit: $limit) {
+              cursor
+              items {
+                id
+                name
+                created_at
+                column_values(ids: $columnIds) { id text value }
+              }
+            }
+          }
+        }
+        """
+        data = self._execute(query, {"boardId": [str(board_id)], "limit": PAGE_LIMIT, "columnIds": column_ids})
+        boards = data.get("boards") or []
+        if not boards:
+            raise MondayAPIError(f"Monday board {board_id} not found or not accessible with this token")
+        page = boards[0]["items_page"]
+        for item in page["items"]:
+            yield item
+        cursor = page["cursor"]
+
+        next_query = """
+        query ($cursor: String!, $limit: Int, $columnIds: [String!]) {
+          next_items_page(cursor: $cursor, limit: $limit) {
+            cursor
+            items {
+              id
+              name
+              created_at
+              column_values(ids: $columnIds) { id text value }
+            }
+          }
+        }
+        """
+        while cursor:
+            data = self._execute(next_query, {"cursor": cursor, "limit": PAGE_LIMIT, "columnIds": column_ids})
+            page = data["next_items_page"]
+            for item in page["items"]:
+                yield item
+            cursor = page["cursor"]
+
+    def get_items_with_created_at(self, board_id, column_ids):
+        """Read-only: like get_items(), but includes each item's created_at,
+        and is FULLY PAGINATED across the whole board (not limited to a
+        first-page sample like get_sample_items_with_created_at). Used by
+        diagnostics that need to inspect every item's created_at - e.g.
+        investigating duplicate unique keys across an entire board. Makes
+        no writes of any kind."""
+        results = []
+        for item in self._iter_board_items_with_created_at(board_id, column_ids):
+            columns = {column_id: self._column_text(item, column_id) for column_id in column_ids}
+            results.append({
+                "item_id": item["id"],
+                "item_name": item.get("name"),
+                "created_at": item.get("created_at"),
+                "columns": columns,
+            })
+        return results
+
     def get_student_lookup(self, board_id, teachworks_id_column):
         """Return {teachworks_student_id (str): monday_item_id (str)} for every
         Student item that has a Teachworks Student ID populated."""
