@@ -1667,6 +1667,161 @@ def diagnose_baseline_migration_cutover(monday_client):
     return 0
 
 
+# --- One-time baseline+SET migration APPLY -------------------------------
+#
+# Wholly separate from normal sync behavior: does not call or modify
+# run_sync(), Teachworks retrieval, Session Log creation/dedup/connection
+# logic, _group_session_log_rows_by_student(),
+# compute_student_rollup_updates(), or
+# _group_post_baseline_session_log_rows_by_student(). Reachable ONLY via
+# --apply-baseline-migration.
+
+def apply_baseline_migration(monday_client):
+    """Computes the write set from ONE frozen Students + Session Log
+    snapshot (two get_items() calls, back-to-back, no writes in between),
+    using the exact same calculation demonstrated by the approved
+    --diagnose-baseline-migration-cutover preview, then performs the real
+    writes:
+
+    - Each Student whose Historical Session Baseline is not already
+      populated gets ONLY that column SET to their current Session Count
+      (blank/null Session Count -> baseline 0). Session Count itself is
+      never written.
+    - Each Session Log item in the frozen snapshot that isn't already
+      marked gets ONLY Pre-Baseline SET to Yes. No other Session Log
+      column is written, and no row is deleted, archived, or merged -
+      historical duplicates stay in place.
+
+    An already-migrated student (Historical Session Baseline already
+    populated) or an already-marked Session Log row is skipped entirely -
+    never re-written - so this is safe to re-run.
+
+    One write failure is logged and does NOT stop the remaining writes.
+    Returns a dict of counts/failures for the CLI wrapper to report."""
+    student_columns = [
+        config.STUDENT_BOARD_COL_TEACHWORKS_ID,
+        config.STUDENT_COL_SESSION_COUNT,
+        config.STUDENT_COL_HISTORICAL_BASELINE,
+    ]
+    session_columns = [
+        config.COL_UNIQUE_ID,
+        config.COL_TEACHWORKS_STUDENT_ID,
+        config.COL_SESSION_DATE,
+        config.COL_TUTOR,
+        config.COL_PRE_BASELINE,
+    ]
+    student_items = monday_client.get_items(config.MONDAY_STUDENTS_BOARD_ID, student_columns)
+    session_items = monday_client.get_items(config.MONDAY_SESSIONS_BOARD_ID, session_columns)
+
+    students_to_baseline = []
+    for item in student_items:
+        cols = item["columns"]
+        baseline_raw = (cols.get(config.STUDENT_COL_HISTORICAL_BASELINE) or "").strip()
+        if baseline_raw:
+            continue
+        raw_count = (cols.get(config.STUDENT_COL_SESSION_COUNT) or "").strip()
+        try:
+            count = int(raw_count)
+        except ValueError:
+            count = 0
+        students_to_baseline.append({"item_id": item["item_id"], "baseline": count})
+
+    session_rows_to_mark = [
+        item["item_id"] for item in session_items
+        if not (item["columns"].get(config.COL_PRE_BASELINE) or "").strip()
+    ]
+
+    student_writes_succeeded = 0
+    student_writes_failed = []
+    for row in students_to_baseline:
+        try:
+            monday_client.update_student_columns(
+                config.MONDAY_STUDENTS_BOARD_ID,
+                row["item_id"],
+                {config.STUDENT_COL_HISTORICAL_BASELINE: row["baseline"]},
+            )
+            student_writes_succeeded += 1
+        except Exception as exc:  # noqa: BLE001 - one bad write must not stop the migration
+            logger.error("BASELINE_WRITE_ERROR item_id=%s error=%s", row["item_id"], exc)
+            student_writes_failed.append({"item_id": row["item_id"], "error": str(exc)})
+
+    session_writes_succeeded = 0
+    session_writes_failed = []
+    for item_id in session_rows_to_mark:
+        try:
+            monday_client.update_student_columns(
+                config.MONDAY_SESSIONS_BOARD_ID,
+                item_id,
+                {config.COL_PRE_BASELINE: {"checked": "true"}},
+            )
+            session_writes_succeeded += 1
+        except Exception as exc:  # noqa: BLE001 - one bad write must not stop the migration
+            logger.error("PRE_BASELINE_WRITE_ERROR item_id=%s error=%s", item_id, exc)
+            session_writes_failed.append({"item_id": item_id, "error": str(exc)})
+
+    return {
+        "students_to_baseline": len(students_to_baseline),
+        "student_writes_succeeded": student_writes_succeeded,
+        "student_writes_failed": student_writes_failed,
+        "session_rows_to_mark": len(session_rows_to_mark),
+        "session_writes_succeeded": session_writes_succeeded,
+        "session_writes_failed": session_writes_failed,
+    }
+
+
+def run_baseline_migration_apply(monday_client):
+    """CLI-facing wrapper: performs the one-time baseline migration apply
+    and prints the required summary. Only reachable via
+    --apply-baseline-migration (enforced in main())."""
+    if config.STUDENT_COL_HISTORICAL_BASELINE is None or config.COL_PRE_BASELINE is None:
+        print("ERROR: --apply-baseline-migration requires both new column IDs to be configured first.")
+        print("  config.STUDENT_COL_HISTORICAL_BASELINE and config.COL_PRE_BASELINE are still None.")
+        print("  Run --diagnose-baseline-migration-columns first if either is missing.")
+        return 1
+
+    print("=" * 70)
+    print("BASELINE MIGRATION APPLY (one-time, REAL Monday writes)")
+    print("One frozen snapshot: Students + Session Log read back-to-back before any write.")
+    print("=" * 70)
+
+    outcome = apply_baseline_migration(monday_client)
+
+    print(f"\nStudents to receive Historical Session Baseline (from this snapshot): {outcome['students_to_baseline']}")
+    print(f"Session Log rows to mark Pre-Baseline = Yes (from this snapshot): {outcome['session_rows_to_mark']}")
+
+    if outcome["student_writes_failed"]:
+        print(f"\nFAILED student baseline writes: {len(outcome['student_writes_failed'])}")
+        for f in outcome["student_writes_failed"]:
+            print(f"  Monday item {f['item_id']}: {f['error']}")
+
+    if outcome["session_writes_failed"]:
+        print(f"\nFAILED Session Log Pre-Baseline writes: {len(outcome['session_writes_failed'])}")
+        for f in outcome["session_writes_failed"]:
+            print(f"  Monday item {f['item_id']}: {f['error']}")
+
+    total_succeeded = outcome["student_writes_succeeded"] + outcome["session_writes_succeeded"]
+    total_failed = len(outcome["student_writes_failed"]) + len(outcome["session_writes_failed"])
+
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"Student baseline writes succeeded: {outcome['student_writes_succeeded']}")
+    print(f"Student baseline writes failed: {len(outcome['student_writes_failed'])}")
+    print(f"Session Log Pre-Baseline writes succeeded: {outcome['session_writes_succeeded']}")
+    print(f"Session Log Pre-Baseline writes failed: {len(outcome['session_writes_failed'])}")
+    print(f"Total successful writes: {total_succeeded}")
+    print(f"Total failed writes: {total_failed}")
+
+    print("\n" + "=" * 70)
+    if total_failed:
+        print(f"FINAL RESULT: FAILED - {total_failed} write(s) failed. See above.")
+        print("Safe to re-run: already-migrated students and already-marked Session Log rows are skipped.")
+    else:
+        print("FINAL RESULT: SUCCESS - baseline migration applied with zero failures.")
+    print("=" * 70)
+    return 1 if total_failed else 0
+
+
 def run_student_rollup_dry_run(monday_client, today=None):
     """Stage 2, combined dry run: runs the real rollup calculation
     (compute_student_rollup_updates) and reports it. Makes ZERO Monday
@@ -1815,6 +1970,7 @@ def main(argv=None):
     parser.add_argument("--diagnose-baseline-migration", action="store_true", help="Read-only: full migration dry run for the baseline+SET architecture (Students Historical Session Baseline, Session Log Pre-Baseline). Requires config.STUDENT_COL_HISTORICAL_BASELINE / config.COL_PRE_BASELINE to be set first. Reads Monday.com but makes zero writes.")
     parser.add_argument("--diagnose-session-log-duplicates", action="store_true", help="Read-only: investigate duplicate Session Log unique identities in detail (exact duplicates and cross-format bare/composite key collisions), with full row detail and created_at. Reads Monday.com but makes zero writes.")
     parser.add_argument("--diagnose-baseline-migration-cutover", action="store_true", help="Read-only: one frozen-snapshot migration cutover preview (Students + Session Log), including an in-memory post-migration simulation proving post-baseline identities start at zero. Requires config.STUDENT_COL_HISTORICAL_BASELINE / config.COL_PRE_BASELINE to be set first. Reads Monday.com but makes zero writes.")
+    parser.add_argument("--apply-baseline-migration", action="store_true", help="ONE-TIME REAL WRITE: applies the baseline+SET migration from one frozen Students + Session Log snapshot - sets each unmigrated student's Historical Session Baseline to their current Session Count, and marks each unmarked Session Log row in the snapshot Pre-Baseline = Yes. Never touches Session Count or any other existing field. Safe to re-run (already-migrated items are skipped). Requires config.STUDENT_COL_HISTORICAL_BASELINE / config.COL_PRE_BASELINE to be set first.")
     parser.add_argument("--student-rollups", action="store_true", help="Calculate production-ready Student rollup updates (baseline+delta, per-student checkpoint). Combine with --dry-run to preview, or --apply to perform the real Monday writes.")
     parser.add_argument("--apply", action="store_true", help="Perform REAL Monday writes for --student-rollups. Writes never happen just because --dry-run is absent - --apply must be passed explicitly.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (default INFO).")
@@ -1885,6 +2041,9 @@ def main(argv=None):
 
     if args.diagnose_baseline_migration_cutover:
         return diagnose_baseline_migration_cutover(monday_client)
+
+    if args.apply_baseline_migration:
+        return run_baseline_migration_apply(monday_client)
 
     if args.student_rollups:
         if args.apply and args.dry_run:
