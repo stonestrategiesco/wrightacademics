@@ -1420,6 +1420,95 @@ def diagnose_session_log_duplicates(monday_client, sample_size=25):
     return 0
 
 
+# --- Post-baseline canonical identity dedup -----------------------------
+#
+# NOT YET WIRED to any CLI command, write path, or the future --daily-sync.
+# This is new, additive logic for the future baseline+SET nightly rollup
+# calculation. _group_session_log_rows_by_student() above backs the
+# CURRENT, still-live date-checkpoint --student-rollups command and is
+# deliberately left untouched by everything below - a different function
+# is needed because the post-baseline calculation requires a different
+# notion of "duplicate": canonical (lesson_id, Teachworks Student ID)
+# identity, not literal unique_key text, so a legacy bare key and a
+# composite key for the same lesson+student collapse to one (see
+# --diagnose-session-log-duplicates, which found 14 such collisions in
+# production).
+#
+# Columns this will need once it IS wired up (not used by anything yet).
+_POST_BASELINE_ROLLUP_SOURCE_COLUMNS = [
+    config.COL_UNIQUE_ID,
+    config.COL_TEACHWORKS_STUDENT_ID,
+    config.COL_SESSION_DATE,
+    config.COL_TUTOR,
+    config.COL_PRE_BASELINE,
+]
+
+
+def _canonical_session_identity(item):
+    """(lesson_id, teachworks_student_id) for one Session Log item.
+    teachworks_student_id always comes from the item's own
+    COL_TEACHWORKS_STUDENT_ID column (authoritative), never parsed out of
+    the unique_key's suffix. lesson_id is derived from unique_key via
+    _unique_key_format_and_lesson_id(), which already handles both the
+    composite ('{lesson_id}_{student_id}') and legacy bare formats - so a
+    bare key and a composite key for the same lesson+student produce the
+    identical identity here. Falls back to (None, item_id) when either
+    half is missing, so a row is never silently dropped - it just can't be
+    collapsed with anything else."""
+    cols = item["columns"]
+    _key_format, lesson_id = _unique_key_format_and_lesson_id(cols.get(config.COL_UNIQUE_ID))
+    tw_student_id = cols.get(config.COL_TEACHWORKS_STUDENT_ID)
+    if lesson_id and tw_student_id:
+        return (lesson_id, tw_student_id)
+    return (None, item["item_id"])
+
+
+def _group_post_baseline_session_log_rows_by_student(session_log_items):
+    """Like _group_session_log_rows_by_student(), but for the future
+    baseline+SET architecture:
+
+    1. Rows with Pre-Baseline=Yes are excluded FIRST, unconditionally -
+       before any dedup happens. A Pre-Baseline row can never suppress,
+       merge with, or contribute to a post-baseline count, regardless of
+       whether it shares a canonical identity with a surviving row.
+    2. The remaining (post-baseline) rows are deduped by canonical
+       (lesson_id, Teachworks Student ID) identity - see
+       _canonical_session_identity() - instead of literal unique_key text,
+       so a legacy bare key and a composite key for the same lesson+student
+       collapse to one.
+    3. Survivors are grouped by Teachworks Student ID, same output shape as
+       _group_session_log_rows_by_student(): {tw_id: [(session_date,
+       item_id, tutor), ...]}, sorted by (date, item_id). A row with a
+       blank Teachworks Student ID or blank session_date is skipped from
+       grouping, matching that function's existing behavior.
+
+    Does not call or modify _group_session_log_rows_by_student()."""
+    post_baseline_items = [
+        item for item in session_log_items
+        if not (item["columns"].get(config.COL_PRE_BASELINE) or "").strip()
+    ]
+
+    deduped = {}
+    for item in post_baseline_items:
+        identity = _canonical_session_identity(item)
+        if identity not in deduped:
+            deduped[identity] = item
+
+    rows_by_student = {}
+    for item in deduped.values():
+        cols = item["columns"]
+        tw_id = cols.get(config.COL_TEACHWORKS_STUDENT_ID)
+        session_date = cols.get(config.COL_SESSION_DATE)
+        if not tw_id or not session_date:
+            continue
+        tutor = cols.get(config.COL_TUTOR)
+        rows_by_student.setdefault(tw_id, []).append((session_date, item["item_id"], tutor))
+
+    for rows in rows_by_student.values():
+        rows.sort(key=lambda row: (row[0], row[1]))
+    return rows_by_student
+
+
 def run_student_rollup_dry_run(monday_client, today=None):
     """Stage 2, combined dry run: runs the real rollup calculation
     (compute_student_rollup_updates) and reports it. Makes ZERO Monday
