@@ -1509,6 +1509,164 @@ def _group_post_baseline_session_log_rows_by_student(session_log_items):
     return rows_by_student
 
 
+def diagnose_baseline_migration_cutover(monday_client):
+    """Read-only migration CUTOVER preview. Reads ONE frozen snapshot each
+    of the Students board and the Session Log board (two get_items() calls,
+    back-to-back, nothing written in between or after), and reports exactly
+    what a real one-time migration would do against that snapshot - plus an
+    in-memory simulation of the state immediately after it. Makes ZERO
+    Monday writes.
+
+    Refuses to run (prints an error, returns 1) if the two migration
+    column IDs are not yet configured - same guard as
+    diagnose_baseline_migration().
+
+    Reuses, without modifying: _unique_key_format_and_lesson_id(),
+    _canonical_session_identity(), and
+    _group_post_baseline_session_log_rows_by_student(). Does not call or
+    touch _group_session_log_rows_by_student() or
+    compute_student_rollup_updates() - the separate, still-live
+    date-checkpoint rollup path."""
+    if config.STUDENT_COL_HISTORICAL_BASELINE is None or config.COL_PRE_BASELINE is None:
+        print("ERROR: --diagnose-baseline-migration-cutover requires both new column IDs to be configured first.")
+        print("  config.STUDENT_COL_HISTORICAL_BASELINE and config.COL_PRE_BASELINE are still None.")
+        print("  Run --diagnose-baseline-migration-columns first if either is missing.")
+        return 1
+
+    print("=" * 70)
+    print("BASELINE MIGRATION CUTOVER PREVIEW (read-only, zero Monday writes)")
+    print("One frozen snapshot: Students + Session Log read back-to-back, no writes in between.")
+    print("=" * 70)
+
+    student_columns = [
+        config.STUDENT_BOARD_COL_TEACHWORKS_ID,
+        config.STUDENT_COL_SESSION_COUNT,
+        config.STUDENT_COL_HISTORICAL_BASELINE,
+    ]
+    session_columns = [
+        config.COL_UNIQUE_ID,
+        config.COL_TEACHWORKS_STUDENT_ID,
+        config.COL_SESSION_DATE,
+        config.COL_TUTOR,
+        config.COL_PRE_BASELINE,
+    ]
+    student_items = monday_client.get_items(config.MONDAY_STUDENTS_BOARD_ID, student_columns)
+    session_items = monday_client.get_items(config.MONDAY_SESSIONS_BOARD_ID, session_columns)
+
+    # --- STUDENTS ---
+    students_evaluated = len(student_items)
+    would_receive_baseline = []
+    blank_or_zero_count = 0
+    for item in student_items:
+        cols = item["columns"]
+        raw = (cols.get(config.STUDENT_COL_SESSION_COUNT) or "").strip()
+        try:
+            count = int(raw)
+        except ValueError:
+            count = 0
+        if not raw or count == 0:
+            blank_or_zero_count += 1
+
+        baseline_raw = (cols.get(config.STUDENT_COL_HISTORICAL_BASELINE) or "").strip()
+        if not baseline_raw:
+            would_receive_baseline.append({
+                "item_id": item["item_id"],
+                "student_name": item.get("item_name") or "",
+                "count": count,
+            })
+
+    baseline_sum = sum(row["count"] for row in would_receive_baseline)
+
+    print("\n--- STUDENTS ---")
+    print(f"Students evaluated: {students_evaluated}")
+    print(f"Students that would receive Historical Session Baseline: {len(would_receive_baseline)}")
+    print(f"Sum of current Session Count values that would be frozen into Historical Session Baseline: {baseline_sum}")
+    print(f"Students with blank/zero Session Count: {blank_or_zero_count}")
+
+    # --- SESSION LOG CUTOVER ---
+    rows_evaluated = len(session_items)
+    already_pre_baseline = 0
+    would_be_marked = 0
+    by_unique_key = {}
+    identity_counts = {}
+    missing_identity = 0
+    for item in session_items:
+        pre_baseline_raw = (item["columns"].get(config.COL_PRE_BASELINE) or "").strip()
+        if pre_baseline_raw:
+            already_pre_baseline += 1
+        else:
+            would_be_marked += 1
+
+        unique_key = (item["columns"].get(config.COL_UNIQUE_ID) or "").strip()
+        if unique_key:
+            by_unique_key.setdefault(unique_key, []).append(item)
+
+        identity = _canonical_session_identity(item)
+        if identity[0] is None:
+            missing_identity += 1
+        identity_counts[identity] = identity_counts.get(identity, 0) + 1
+
+    exact_duplicate_groups = {key: group for key, group in by_unique_key.items() if len(group) > 1}
+
+    by_lesson_id_formats = {}
+    for item in session_items:
+        key_format, lesson_id = _unique_key_format_and_lesson_id(item["columns"].get(config.COL_UNIQUE_ID))
+        if lesson_id is None:
+            continue
+        by_lesson_id_formats.setdefault(lesson_id, set()).add(key_format)
+    cross_format_groups = {
+        lesson_id: formats for lesson_id, formats in by_lesson_id_formats.items()
+        if "legacy_bare" in formats and "composite" in formats
+    }
+
+    distinct_identities = len(identity_counts)
+    duplicate_rows_collapsed = rows_evaluated - distinct_identities
+
+    print("\n--- SESSION LOG CUTOVER ---")
+    print(f"Total Session Log rows in the frozen snapshot: {rows_evaluated}")
+    print(f"Rows that would be marked Pre-Baseline = Yes: {would_be_marked}")
+    print(f"  (already marked Pre-Baseline = Yes: {already_pre_baseline})")
+    print(f"Distinct canonical session identities represented: {distinct_identities}")
+    print(f"Duplicate physical rows collapsed by canonical identity: {duplicate_rows_collapsed}")
+    print(f"Exact-key duplicate groups: {len(exact_duplicate_groups)}")
+    print(f"Cross-format bare/composite duplicate groups: {len(cross_format_groups)}")
+    print(f"Rows missing canonical identity information: {missing_identity}")
+
+    # --- POST-MIGRATION VALIDATION (in-memory simulation only, no writes) ---
+    simulated_items = [
+        {**item, "columns": {**item["columns"], config.COL_PRE_BASELINE: "v"}}
+        for item in session_items
+    ]
+    post_migration_groups = _group_post_baseline_session_log_rows_by_student(simulated_items)
+    post_migration_identity_count = sum(len(rows) for rows in post_migration_groups.values())
+
+    print("\n--- POST-MIGRATION VALIDATION (in-memory simulation, zero Monday writes) ---")
+    print("Simulated: every row in this frozen snapshot has Pre-Baseline = Yes.")
+    print(f"Post-baseline session identities immediately after migration: {post_migration_identity_count}")
+    if post_migration_identity_count == 0:
+        print("CONFIRMED: no existing historical Session Log row can contribute again after cutover.")
+        print("Therefore each student's proposed Session Count immediately after migration remains")
+        print("exactly its frozen Historical Session Baseline (baseline + 0 post-baseline = baseline).")
+    else:
+        print("WARNING: expected 0 post-baseline identities immediately after a full-snapshot cutover.")
+        print("This means the simulation or the frozen snapshot is inconsistent - investigate before migrating.")
+
+    # --- PROPOSED MIGRATION WRITE COUNTS (not performed - preview only) ---
+    student_baseline_writes = len(would_receive_baseline)
+    session_log_pre_baseline_writes = would_be_marked
+    total_writes = student_baseline_writes + session_log_pre_baseline_writes
+
+    print("\n--- PROPOSED MIGRATION WRITE COUNTS (not performed - preview only) ---")
+    print(f"Student baseline writes: {student_baseline_writes}")
+    print(f"Session Log Pre-Baseline writes: {session_log_pre_baseline_writes}")
+    print(f"Total Monday items that would be modified: {total_writes}")
+
+    print("\n" + "=" * 70)
+    print("DIAGNOSTIC COMPLETE - read-only. Zero Monday writes were made.")
+    print("=" * 70)
+    return 0
+
+
 def run_student_rollup_dry_run(monday_client, today=None):
     """Stage 2, combined dry run: runs the real rollup calculation
     (compute_student_rollup_updates) and reports it. Makes ZERO Monday
@@ -1656,6 +1814,7 @@ def main(argv=None):
     parser.add_argument("--diagnose-baseline-migration-columns", action="store_true", help="Read-only: search the Students and Session Log boards for the Historical Session Baseline / Pre-Baseline columns needed by the baseline+SET migration, and report their real IDs if found. Reads Monday.com but makes zero writes.")
     parser.add_argument("--diagnose-baseline-migration", action="store_true", help="Read-only: full migration dry run for the baseline+SET architecture (Students Historical Session Baseline, Session Log Pre-Baseline). Requires config.STUDENT_COL_HISTORICAL_BASELINE / config.COL_PRE_BASELINE to be set first. Reads Monday.com but makes zero writes.")
     parser.add_argument("--diagnose-session-log-duplicates", action="store_true", help="Read-only: investigate duplicate Session Log unique identities in detail (exact duplicates and cross-format bare/composite key collisions), with full row detail and created_at. Reads Monday.com but makes zero writes.")
+    parser.add_argument("--diagnose-baseline-migration-cutover", action="store_true", help="Read-only: one frozen-snapshot migration cutover preview (Students + Session Log), including an in-memory post-migration simulation proving post-baseline identities start at zero. Requires config.STUDENT_COL_HISTORICAL_BASELINE / config.COL_PRE_BASELINE to be set first. Reads Monday.com but makes zero writes.")
     parser.add_argument("--student-rollups", action="store_true", help="Calculate production-ready Student rollup updates (baseline+delta, per-student checkpoint). Combine with --dry-run to preview, or --apply to perform the real Monday writes.")
     parser.add_argument("--apply", action="store_true", help="Perform REAL Monday writes for --student-rollups. Writes never happen just because --dry-run is absent - --apply must be passed explicitly.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (default INFO).")
@@ -1723,6 +1882,9 @@ def main(argv=None):
 
     if args.diagnose_session_log_duplicates:
         return diagnose_session_log_duplicates(monday_client)
+
+    if args.diagnose_baseline_migration_cutover:
+        return diagnose_baseline_migration_cutover(monday_client)
 
     if args.student_rollups:
         if args.apply and args.dry_run:
