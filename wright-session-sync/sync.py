@@ -1822,6 +1822,185 @@ def run_baseline_migration_apply(monday_client):
     return 1 if total_failed else 0
 
 
+# --- Post-baseline student rollup calculation (baseline+SET architecture) -
+#
+# Wholly separate from the date-checkpoint path above
+# (_group_session_log_rows_by_student / compute_student_rollup_updates),
+# which is left completely untouched. Session Count here is a pure, fully
+# idempotent recomputation - not an increment, and not gated by a
+# checkpoint - so re-running it any number of times, from any prior state,
+# always yields the identical result for unchanged Monday data:
+#   Session Count = Historical Session Baseline
+#                    + count of distinct canonical post-baseline identities
+# Last Session Date / Tutor only ever move FORWARD, compared directly
+# against the student's own currently-stored Last Session Date (not a
+# separate checkpoint) - so an older, late-arriving post-baseline session
+# can raise Session Count but can never regress Last Session Date or
+# Tutor. First Session Date is never read or written.
+
+def compute_post_baseline_student_rollup_updates(monday_client):
+    """Read-only: calculates, for every Monday Student item, what the
+    baseline+SET rollup update would be. Calls monday_client.get_items()
+    only - never any write method.
+
+    Reuses _group_post_baseline_session_log_rows_by_student() exactly as
+    built and tested (Pre-Baseline=Yes rows excluded first, then the
+    remainder deduped by canonical (lesson_id, Teachworks Student ID)
+    identity) for the authoritative per-student session counts/dates used
+    below. Does not call or modify run_sync(), Teachworks retrieval,
+    Session Log creation/dedup/connection logic,
+    _group_session_log_rows_by_student(), or
+    compute_student_rollup_updates().
+
+    Returns a dict: {
+      "results": [per-student dicts],
+      "distinct_post_baseline_sessions": count of distinct canonical
+        identities among ALL non-Pre-Baseline Session Log rows,
+      "duplicate_rows_collapsed": physical post-baseline rows minus that
+        distinct count,
+      "missing_identity_rows": post-baseline rows missing enough
+        information to derive a canonical identity or be attributed to a
+        student (blank unique_key, blank Teachworks Student ID, or blank
+        Session Date),
+    }."""
+    session_log_items = monday_client.get_items(config.MONDAY_SESSIONS_BOARD_ID, _POST_BASELINE_ROLLUP_SOURCE_COLUMNS)
+
+    post_baseline_items = [
+        item for item in session_log_items
+        if not (item["columns"].get(config.COL_PRE_BASELINE) or "").strip()
+    ]
+    identity_counts = {}
+    missing_identity_rows = 0
+    for item in post_baseline_items:
+        cols = item["columns"]
+        identity = _canonical_session_identity(item)
+        if identity[0] is None or not cols.get(config.COL_TEACHWORKS_STUDENT_ID) or not cols.get(config.COL_SESSION_DATE):
+            missing_identity_rows += 1
+        identity_counts[identity] = identity_counts.get(identity, 0) + 1
+    distinct_post_baseline_sessions = len(identity_counts)
+    duplicate_rows_collapsed = len(post_baseline_items) - distinct_post_baseline_sessions
+
+    rows_by_student = _group_post_baseline_session_log_rows_by_student(session_log_items)
+
+    student_columns = [
+        config.STUDENT_BOARD_COL_TEACHWORKS_ID,
+        config.STUDENT_COL_HISTORICAL_BASELINE,
+        config.STUDENT_COL_SESSION_COUNT,
+        config.STUDENT_COL_LAST_SESSION_DATE,
+        config.STUDENT_COL_TUTOR,
+    ]
+    student_items = monday_client.get_items(config.MONDAY_STUDENTS_BOARD_ID, student_columns)
+
+    results = []
+    for item in student_items:
+        cols = item["columns"]
+        tw_id = cols.get(config.STUDENT_BOARD_COL_TEACHWORKS_ID)
+        student_name = item.get("item_name") or "(unnamed)"
+
+        if not tw_id:
+            results.append({
+                "monday_item_id": item["item_id"],
+                "student_name": student_name,
+                "teachworks_student_id": None,
+                "matched": False,
+            })
+            continue
+
+        baseline_raw = (cols.get(config.STUDENT_COL_HISTORICAL_BASELINE) or "").strip()
+        try:
+            historical_baseline = int(baseline_raw)
+        except ValueError:
+            historical_baseline = 0
+
+        current_count_raw = (cols.get(config.STUDENT_COL_SESSION_COUNT) or "").strip()
+        try:
+            current_count = int(current_count_raw)
+        except ValueError:
+            current_count = 0
+
+        current_last_session = cols.get(config.STUDENT_COL_LAST_SESSION_DATE) or ""
+        current_tutor = cols.get(config.STUDENT_COL_TUTOR) or ""
+
+        post_baseline_rows = rows_by_student.get(tw_id, [])
+        proposed_count = historical_baseline + len(post_baseline_rows)
+
+        if post_baseline_rows:
+            latest_date, _latest_item_id, latest_tutor = post_baseline_rows[-1]
+        else:
+            latest_date, latest_tutor = None, None
+
+        if latest_date and latest_date > current_last_session:
+            proposed_last_session = latest_date
+            proposed_tutor = latest_tutor
+        else:
+            proposed_last_session = current_last_session
+            proposed_tutor = current_tutor
+
+        results.append({
+            "monday_item_id": item["item_id"],
+            "student_name": student_name,
+            "teachworks_student_id": tw_id,
+            "matched": True,
+            "historical_baseline": historical_baseline,
+            "post_baseline_session_count": len(post_baseline_rows),
+            "current_count": current_count,
+            "proposed_count": proposed_count,
+            "current_last_session": current_last_session or "(blank)",
+            "proposed_last_session": proposed_last_session or "(blank)",
+            "current_tutor": current_tutor or "(blank)",
+            "proposed_tutor": proposed_tutor or "(blank)",
+        })
+
+    return {
+        "results": results,
+        "distinct_post_baseline_sessions": distinct_post_baseline_sessions,
+        "duplicate_rows_collapsed": duplicate_rows_collapsed,
+        "missing_identity_rows": missing_identity_rows,
+    }
+
+
+def run_post_baseline_rollup_dry_run(monday_client, sample_size=25):
+    """Read-only dry run for the baseline+SET student rollup calculation.
+    Makes ZERO Monday writes - MondayClient.update_student_columns() is
+    never called from this path."""
+    print("=" * 70)
+    print("POST-BASELINE STUDENT ROLLUP - DRY RUN (zero Monday writes)")
+    print("Session Count = Historical Session Baseline + distinct post-baseline identities")
+    print("=" * 70)
+
+    outcome = compute_post_baseline_student_rollup_updates(monday_client)
+    results = outcome["results"]
+    matched = [r for r in results if r["matched"]]
+    unmatched = [r for r in results if not r["matched"]]
+
+    baseline_total = sum(r["historical_baseline"] for r in matched)
+    differs = [r for r in matched if r["proposed_count"] != r["current_count"]]
+    missing_matches = len(unmatched) + outcome["missing_identity_rows"]
+
+    print("\n--- SUMMARY ---")
+    print(f"Students evaluated: {len(results)}")
+    print(f"Historical baseline total (across matched students): {baseline_total}")
+    print(f"Distinct post-baseline sessions: {outcome['distinct_post_baseline_sessions']}")
+    print(f"Students whose calculated Session Count differs from Monday: {len(differs)}")
+    print(f"Duplicate physical rows collapsed by canonical identity: {outcome['duplicate_rows_collapsed']}")
+    print(f"Missing identity/student matches: {missing_matches}")
+    print(f"  (unmatched students - blank Teachworks Student ID: {len(unmatched)})")
+    print(f"  (Session Log rows missing identity/student/date info: {outcome['missing_identity_rows']})")
+
+    if differs:
+        print(f"\n--- CHANGES (first {min(sample_size, len(differs))} of {len(differs)}) ---")
+        for r in sorted(differs, key=lambda r: r["student_name"])[:sample_size]:
+            print(f"\n{r['student_name']} (item {r['monday_item_id']}):")
+            print(f"  Session Count:      {r['current_count']} -> {r['proposed_count']}")
+            print(f"  Last Session Date:  {r['current_last_session']} -> {r['proposed_last_session']}")
+            print(f"  Tutor:              {r['current_tutor']} -> {r['proposed_tutor']}")
+
+    print("\n" + "=" * 70)
+    print("DIAGNOSTIC COMPLETE - read-only. Zero Monday writes were made.")
+    print("=" * 70)
+    return 0
+
+
 def run_student_rollup_dry_run(monday_client, today=None):
     """Stage 2, combined dry run: runs the real rollup calculation
     (compute_student_rollup_updates) and reports it. Makes ZERO Monday
@@ -1971,6 +2150,7 @@ def main(argv=None):
     parser.add_argument("--diagnose-session-log-duplicates", action="store_true", help="Read-only: investigate duplicate Session Log unique identities in detail (exact duplicates and cross-format bare/composite key collisions), with full row detail and created_at. Reads Monday.com but makes zero writes.")
     parser.add_argument("--diagnose-baseline-migration-cutover", action="store_true", help="Read-only: one frozen-snapshot migration cutover preview (Students + Session Log), including an in-memory post-migration simulation proving post-baseline identities start at zero. Requires config.STUDENT_COL_HISTORICAL_BASELINE / config.COL_PRE_BASELINE to be set first. Reads Monday.com but makes zero writes.")
     parser.add_argument("--apply-baseline-migration", action="store_true", help="ONE-TIME REAL WRITE: applies the baseline+SET migration from one frozen Students + Session Log snapshot - sets each unmigrated student's Historical Session Baseline to their current Session Count, and marks each unmarked Session Log row in the snapshot Pre-Baseline = Yes. Never touches Session Count or any other existing field. Safe to re-run (already-migrated items are skipped). Requires config.STUDENT_COL_HISTORICAL_BASELINE / config.COL_PRE_BASELINE to be set first.")
+    parser.add_argument("--post-baseline-rollups", action="store_true", help="Calculate the baseline+SET student rollup (Session Count = Historical Session Baseline + distinct post-baseline Session Log identities). Only --dry-run is implemented so far; --apply is not yet built.")
     parser.add_argument("--student-rollups", action="store_true", help="Calculate production-ready Student rollup updates (baseline+delta, per-student checkpoint). Combine with --dry-run to preview, or --apply to perform the real Monday writes.")
     parser.add_argument("--apply", action="store_true", help="Perform REAL Monday writes for --student-rollups. Writes never happen just because --dry-run is absent - --apply must be passed explicitly.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (default INFO).")
@@ -2044,6 +2224,15 @@ def main(argv=None):
 
     if args.apply_baseline_migration:
         return run_baseline_migration_apply(monday_client)
+
+    if args.post_baseline_rollups:
+        if args.apply:
+            print("ERROR: --post-baseline-rollups --apply is not yet implemented. Only --dry-run is available.")
+            return 1
+        if args.dry_run:
+            return run_post_baseline_rollup_dry_run(monday_client)
+        print("ERROR: --post-baseline-rollups requires --dry-run (the only mode currently implemented).")
+        return 1
 
     if args.student_rollups:
         if args.apply and args.dry_run:
