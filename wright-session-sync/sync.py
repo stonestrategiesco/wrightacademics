@@ -2196,6 +2196,127 @@ def run_student_rollup_dry_run(monday_client, today=None):
     return 0
 
 
+def perform_daily_sync(tw_client, monday_client, start_date, end_date):
+    """Smallest possible orchestration of the two already-proven,
+    independently-tested steps, run in order:
+
+    1. run_sync() - the locked Teachworks -> Session Log pipeline, called
+       exactly as the standalone scheduled command calls it (mode=
+       "SCHEDULED (rolling lookback)", dry_run=False).
+    2. IF AND ONLY IF step 1 succeeds,
+       apply_post_baseline_student_rollup_updates() - the baseline+SET
+       student rollup apply, exactly as already built and tested.
+
+    Neither function's business logic is duplicated or modified here -
+    both are called exactly as-is.
+
+    Step 1's success gate matches the existing standalone Session Log
+    command's own semantics (see main(): `return 1 if report.creation_errors
+    else 0`), not a new or stricter rule: run_sync() must return without
+    raising, AND report.creation_errors must be empty.
+    report.missing_students and report.connection_errors are surfaced in
+    the returned dict but do NOT block step 2, and Session Log behavior
+    itself is unchanged either way.
+
+    Returns a dict:
+      "sync_report": the SyncReport from run_sync(), or None if it raised
+        before returning one.
+      "sync_exception": the exception run_sync() raised, or None.
+      "sync_succeeded": bool - whether step 1's gate passed.
+      "rollup_ran": bool - whether step 2 was attempted at all.
+      "rollup_outcome": the dict from
+        apply_post_baseline_student_rollup_updates(), or None if step 2
+        did not run or raised before returning one.
+      "rollup_exception": the exception step 2 raised, or None.
+    """
+    sync_report = None
+    sync_exception = None
+    try:
+        sync_report = run_sync(
+            tw_client, monday_client, start_date, end_date,
+            dry_run=False, mode="SCHEDULED (rolling lookback)",
+        )
+    except Exception as exc:  # noqa: BLE001 - captured so the orchestration can report/exit non-zero instead of crashing
+        sync_exception = exc
+        logger.error("DAILY_SYNC_SESSION_LOG_ERROR error=%s", exc)
+
+    sync_succeeded = sync_exception is None and sync_report is not None and not sync_report.creation_errors
+
+    rollup_ran = False
+    rollup_outcome = None
+    rollup_exception = None
+    if sync_succeeded:
+        rollup_ran = True
+        try:
+            rollup_outcome = apply_post_baseline_student_rollup_updates(monday_client)
+        except Exception as exc:  # noqa: BLE001 - captured so the orchestration can report/exit non-zero instead of crashing
+            rollup_exception = exc
+            logger.error("DAILY_SYNC_ROLLUP_ERROR error=%s", exc)
+
+    return {
+        "sync_report": sync_report,
+        "sync_exception": sync_exception,
+        "sync_succeeded": sync_succeeded,
+        "rollup_ran": rollup_ran,
+        "rollup_outcome": rollup_outcome,
+        "rollup_exception": rollup_exception,
+    }
+
+
+def run_daily_sync(tw_client, monday_client, start_date, end_date):
+    """CLI-facing: runs perform_daily_sync() and prints a concise combined
+    summary (Session Log results, Student Rollup results, FINAL RESULT).
+    Only reachable via --daily-sync."""
+    print("=" * 70)
+    print("DAILY SYNC (Session Log sync -> post-baseline student rollup)")
+    print(f"Date range: {start_date} .. {end_date}")
+    print("=" * 70)
+
+    outcome = perform_daily_sync(tw_client, monday_client, start_date, end_date)
+
+    print("\n--- STEP 1: SESSION LOG SYNC ---")
+    if outcome["sync_exception"] is not None:
+        print(f"EXCEPTION: {outcome['sync_exception']}")
+    else:
+        report = outcome["sync_report"]
+        print(f"Lessons fetched:                {report.lessons_fetched}")
+        print(f"Attended sessions found:        {report.attended_sessions_found}")
+        print(f"Sessions created:               {report.sessions_created}")
+        print(f"Sessions skipped as duplicates: {report.sessions_skipped}")
+        print(f"Creation errors:                {len(report.creation_errors)}")
+        print(f"Missing students:               {len(report.missing_students)}")
+        print(f"Connection errors:              {len(report.connection_errors)}")
+    print(f"Session Log sync succeeded (gate for Step 2): {outcome['sync_succeeded']}")
+
+    print("\n--- STEP 2: POST-BASELINE STUDENT ROLLUP ---")
+    if not outcome["rollup_ran"]:
+        print("SKIPPED - Session Log sync did not succeed (see Step 1 above).")
+    elif outcome["rollup_exception"] is not None:
+        print(f"EXCEPTION: {outcome['rollup_exception']}")
+    else:
+        rollup = outcome["rollup_outcome"]
+        print(f"Students evaluated:           {len(rollup['results'])}")
+        print(f"Writes performed:             {len(rollup['written'])}")
+        print(f"Already correct:              {len(rollup['unchanged'])}")
+        print(f"Skipped (cannot be matched):  {len(rollup['skipped_unmatched'])}")
+        print(f"Failed writes:                {len(rollup['failed'])}")
+
+    if not outcome["sync_succeeded"]:
+        final_result = "FAILURE"
+    elif outcome["rollup_exception"] is not None:
+        final_result = "FAILURE"
+    elif outcome["rollup_outcome"] and outcome["rollup_outcome"]["failed"]:
+        final_result = "PARTIAL FAILURE"
+    else:
+        final_result = "SUCCESS"
+
+    print("\n" + "=" * 70)
+    print(f"FINAL RESULT: {final_result}")
+    print("=" * 70)
+
+    return 0 if final_result == "SUCCESS" else 1
+
+
 def print_report(report):
     verb_created = "Sessions that WOULD be created" if report.mode.startswith("DRY RUN") else "Sessions created"
     lines = [
@@ -2283,6 +2404,7 @@ def main(argv=None):
     parser.add_argument("--post-baseline-rollups", action="store_true", help="Calculate the baseline+SET student rollup (Session Count = Historical Session Baseline + distinct post-baseline Session Log identities). Combine with --dry-run to preview, or --apply to perform the real Monday writes.")
     parser.add_argument("--student-rollups", action="store_true", help="Calculate production-ready Student rollup updates (baseline+delta, per-student checkpoint). Combine with --dry-run to preview, or --apply to perform the real Monday writes.")
     parser.add_argument("--apply", action="store_true", help="Perform REAL Monday writes for --student-rollups. Writes never happen just because --dry-run is absent - --apply must be passed explicitly.")
+    parser.add_argument("--daily-sync", action="store_true", help="Orchestrates the nightly pipeline: runs the Session Log sync (rolling lookback), then IF AND ONLY IF it succeeds (no exception, no creation_errors), applies the post-baseline student rollup. Reuses run_sync() and apply_post_baseline_student_rollup_updates() exactly as-is - no duplicated business logic.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (default INFO).")
     args = parser.parse_args(argv)
 
@@ -2379,6 +2501,9 @@ def main(argv=None):
 
     if args.diagnose_dedup:
         return diagnose_dedup(tw_client, monday_client, start_date, end_date)
+
+    if args.daily_sync:
+        return run_daily_sync(tw_client, monday_client, start_date, end_date)
 
     mode = "FULL RECONCILIATION" if args.full else "SCHEDULED (rolling lookback)"
     if args.dry_run:
