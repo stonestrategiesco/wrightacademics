@@ -506,7 +506,21 @@ def load_reporting_monday_config():
 
 
 def month_item_name(year, month):
+    """Canonical Reporting-board item name for a month, e.g. "09 - September 2026".
+    The zero-padded prefix makes the board and its dashboards sort chronologically.
+    Every item this script creates uses this name."""
+    return f"{month:02d} - {calendar.month_name[month]} {year}"
+
+
+def legacy_month_item_name(year, month):
+    """The name items had before the numbered format, e.g. "September 2026".
+    Only ever used to RECOGNISE an existing item - never to create one."""
     return f"{calendar.month_name[month]} {year}"
+
+
+def month_item_names(year, month):
+    """Every name that identifies this month's item: canonical first, then legacy."""
+    return (month_item_name(year, month), legacy_month_item_name(year, month))
 
 
 def reporting_column_ids(monday_cfg):
@@ -606,9 +620,22 @@ def find_matches_by_name(items, target_name):
     return [i for i in items if (i.get("name") or "").strip() == target_name]
 
 
-def find_reporting_item(monday_cfg, target_name):
+def find_month_matches(items, year, month):
+    """Every item that is this month's item under EITHER accepted name
+    ("09 - September 2026" or legacy "September 2026"). More than one match -
+    including one of each form - is a DUPLICATE the callers refuse to guess
+    about; this function never chooses between them."""
+    names = month_item_names(year, month)
+    return [i for i in items if (i.get("name") or "").strip() in names]
+
+
+def describe_matches(matches):
+    return ", ".join(f"id={m['id']} {(m.get('name') or '').strip()!r}" for m in matches)
+
+
+def find_reporting_item(monday_cfg, year, month):
     items = fetch_reporting_items(monday_cfg)
-    matches = find_matches_by_name(items, target_name)
+    matches = find_month_matches(items, year, month)
     return matches, len(items)
 
 
@@ -796,9 +823,10 @@ def preview_monday_changes(monday_cfg, result, year, month):
         )
         return "SKIPPED", None, None
 
-    print(f"\n=== Monday.com preview: item named {target_name!r} on board {monday_cfg['board_id']} ===")
+    names = month_item_names(year, month)
+    print(f"\n=== Monday.com preview: item named {names[0]!r} (or legacy {names[1]!r}) on board {monday_cfg['board_id']} ===")
     try:
-        matches, total_items = find_reporting_item(monday_cfg, target_name)
+        matches, total_items = find_reporting_item(monday_cfg, year, month)
     except sm.MondayApiError as exc:
         print(f"ERROR calling Monday API: {exc}")
         return "ERROR", None, None
@@ -806,13 +834,12 @@ def preview_monday_changes(monday_cfg, result, year, month):
 
     if not matches:
         print(
-            f"NOT FOUND: no existing item named {target_name!r} on this board. This script never "
+            f"NOT FOUND: no existing item named {names[0]!r} or {names[1]!r} on this board. This script never "
             "creates items -- create it in Monday first, then re-run."
         )
         return "NOT_FOUND", None, None
     if len(matches) > 1:
-        ids = [m["id"] for m in matches]
-        print(f"DUPLICATE: {len(matches)} items named {target_name!r} found (ids={ids}) -- ambiguous, will not write.")
+        print(f"DUPLICATE: {len(matches)} items for {target_name!r} found ({describe_matches(matches)}) -- ambiguous, will not write.")
         return "DUPLICATE", None, None
 
     item = matches[0]
@@ -1184,12 +1211,11 @@ def run_multi_update(config, monday_cfg, output_dir, year, start_month, end_mont
     problems = []
     for month in range(start_month, end_month + 1):
         target_name = month_item_name(year, month)
-        matches = find_matches_by_name(items, target_name)
+        matches = find_month_matches(items, year, month)
         if len(matches) == 1:
             matched[month] = matches[0]
         elif len(matches) > 1:
-            ids = [m["id"] for m in matches]
-            problems.append(f"{target_name}: DUPLICATE -- {len(matches)} items found (ids={ids}).")
+            problems.append(f"{target_name}: DUPLICATE -- {len(matches)} items found ({describe_matches(matches)}).")
         elif auto_create_missing:
             if (end_month - start_month + 1) != 1:
                 problems.append(f"{target_name}: NOT FOUND, and auto-create is only supported for a single-month update.")
@@ -1207,7 +1233,8 @@ def run_multi_update(config, monday_cfg, output_dir, year, start_month, end_mont
             print(f"  Found year group {expected_group_title!r} (id={group_id}) -- will create {target_name!r} in it after confirmation.")
             to_create[month] = (group_id, expected_group_title)
         else:
-            problems.append(f"{target_name}: NOT FOUND -- no existing item with this name. This script never creates items.")
+            problems.append(f"{target_name}: NOT FOUND -- no existing item named {target_name!r} or "
+                            f"{legacy_month_item_name(year, month)!r}. This script never creates items.")
 
     if problems:
         print("\nAborting the ENTIRE multi-month update -- nothing was written to Monday:")
@@ -1300,7 +1327,7 @@ def run_multi_update(config, monday_cfg, output_dir, year, start_month, end_mont
                 })
                 any_failure = True
                 continue
-            refreshed_matches = find_matches_by_name(refreshed_items, target_name)
+            refreshed_matches = find_month_matches(refreshed_items, year, month)
             if len(refreshed_matches) != 1:
                 msg = f"created an item but re-fetch found {len(refreshed_matches)} item(s) named this, not exactly 1"
                 print(f"  ERROR: {msg} -- aborting this month rather than guessing which one is correct.")

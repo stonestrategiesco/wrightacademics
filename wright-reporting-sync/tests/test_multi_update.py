@@ -160,7 +160,7 @@ def test_multi_update():
         if query == sm.BOARD_COLUMNS_QUERY:
             return board_schema_response()
         if "items_page" in query and "next_items_page" not in query:
-            items = [make_item(str(100 + i), name) for i, name in enumerate(MONTH_NAMES_1_8) if name != "July 2026"]
+            items = [make_item(str(100 + i), name) for i, name in enumerate(MONTH_NAMES_1_8) if name != sr.month_item_name(2026, 7)]
             return {"boards": [{"items_page": {"cursor": None, "items": items}}]}
         if "change_simple_column_value" in query:
             write_calls.append(variables)
@@ -180,7 +180,7 @@ def test_multi_update():
     print("PASS: a missing month (NOT FOUND) aborts the entire batch, zero writes made")
 
     # =====================================================================
-    # Test 2: duplicate month (two items both named "March 2026") -> aborts
+    # Test 2: duplicate month ("03 - March 2026" plus a legacy "March 2026") -> aborts
     # the ENTIRE batch, writes NOTHING.
     # =====================================================================
     write_calls.clear()
@@ -191,7 +191,7 @@ def test_multi_update():
             return board_schema_response()
         if "items_page" in query and "next_items_page" not in query:
             items = [make_item(str(100 + i), name) for i, name in enumerate(MONTH_NAMES_1_8)]
-            items.append(make_item("999", "March 2026"))  # duplicate
+            items.append(make_item("999", "March 2026"))  # legacy-named copy of the same month -> duplicate
             return {"boards": [{"items_page": {"cursor": None, "items": items}}]}
         if "change_simple_column_value" in query:
             write_calls.append(variables)
@@ -327,7 +327,7 @@ def test_multi_update():
         sr.compute_monthly_financials = orig_compute_monthly_financials
     assert exit_code == 1, exit_code
     assert "Board-schema preflight OK" in output, output
-    assert "financial reconciliation failed for: July 2026" in output, output
+    assert "financial reconciliation failed for: 07 - July 2026" in output, output
     assert "Nothing was written to Monday." in output
     assert calls_made == [], "must not fetch items or write when financial reconciliation fails"
     assert log is None
@@ -456,11 +456,11 @@ def test_multi_update():
 
     output, exit_code, log = run_multi(graphql_financial_mismatch_on_readback)
     assert exit_code == 1, (exit_code, output)  # overall run reports failure since one month failed
-    jan_row = next(r for r in log["months"] if r["month_label"] == "January 2026")
+    jan_row = next(r for r in log["months"] if r["month_label"] == sr.month_item_name(2026, 1))
     assert jan_row["success"] is False, jan_row
     assert "attended_amount" in jan_row["verify_status"], jan_row["verify_status"]
     assert "MISMATCH" in jan_row["verify_status"], jan_row["verify_status"]
-    other_rows = [r for r in log["months"] if r["month_label"] != "January 2026"]
+    other_rows = [r for r in log["months"] if r["month_label"] != sr.month_item_name(2026, 1)]
     assert all(r["success"] for r in other_rows), other_rows
     print(f"PASS: read-back verification catches a financial-field mismatch (January verify_status={jan_row['verify_status']!r}), other months still SUCCEED")
 

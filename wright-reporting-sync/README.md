@@ -144,6 +144,16 @@ verify. Refuses any month that hasn't fully elapsed yet unless
 `--allow-incomplete-month` is passed. Aborts the entire batch before any
 write if any month is missing, duplicated, or fails reconciliation.
 
+### Month item names
+
+Each month is one item on the Reporting board, named
+`{MM} - {Month} {YYYY}` — e.g. `09 - September 2026` — so the board and its
+dashboards sort chronologically. That is the only name this script ever
+creates. Lookups also accept the older `September 2026` form for the same
+month, so existing items keep working without being renamed. If both forms
+exist for one month, that month is treated as a duplicate and the run aborts
+before writing anything; the script never picks one of them.
+
 ### Current-month update (the production/unattended path)
 
 ```bash
