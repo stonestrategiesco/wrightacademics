@@ -170,6 +170,16 @@ aborts. `--yes` skips the interactive confirmation (reads no stdin); every
 other safeguard (schema preflight, reconciliation, exact name matching,
 read-back verification) still applies identically.
 
+`--current-month` always re-fetches Teachworks (it implies
+`--refresh-teachworks-cache`), and the update refuses to write — exit code 1,
+nothing written — unless the Teachworks data was fetched during that same
+run. A cache from an earlier run, even earlier the same day, is never used
+for the current month. Every run logs its source as
+`Teachworks source: FRESH -- fetched by this run at …` or
+`Teachworks source: CACHE -- loaded from …, fetched at …`. Historical and
+manual runs (`--month`, `--month-range`, dry runs) may still use the cache in
+`output/_cache` unless `--refresh-teachworks-cache` is passed.
+
 ---
 
 ## 3. Automated tests

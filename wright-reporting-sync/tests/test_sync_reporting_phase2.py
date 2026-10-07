@@ -163,25 +163,66 @@ def test_sync_reporting_phase2():
     builtins.input = orig_input
 
     # =====================================================================
-    # Test 3: update mode refuses any month other than September 2026 (Phase 2 restriction) -- no Monday calls at all.
+    # Test 3: the temporary September-2026-only guard is gone -- a manual
+    # single-month update of October 2026 goes through the same matching,
+    # preview and typed-YES confirmation, and writes only after YES.
     # =====================================================================
-    write_calls.clear()
-    calls_made = []
-    sm.monday_graphql = lambda *a, **k: calls_made.append(1) or (_ for _ in ()).throw(AssertionError("should never call Monday"))
+    october_lessons = [
+        {"id": 31, "from_datetime": dt(5, month=10), "participants": [{"student_id": 1, "status": "Attended"}]},
+        {"id": 32, "from_datetime": dt(6, month=10), "participants": [{"student_id": 2, "status": "Missed"}]},
+    ]
+    LESSONS.extend(october_lessons)  # October: Attended=1, Missed=1, Total=2, StudentsServed=2
 
+
+    def fake_monday_graphql_october(cfg, query, variables=None, max_retries=3):
+        if "items_page" in query and "next_items_page" not in query:
+            items = [make_item("111", "09 - September 2026", 2, 1, 3, 2), make_item("222", "10 - October 2026", 0, 0, 0, 0)]
+            return {"boards": [{"items_page": {"cursor": None, "items": items}}]}
+        if "change_simple_column_value" in query:
+            write_calls.append(variables)
+            return {"change_simple_column_value": {"id": variables["itemId"]}}
+        raise AssertionError(f"unexpected query: {query[:50]}")
+
+
+    sm.monday_graphql = fake_monday_graphql_october
+
+    # 3a: declining the confirmation writes nothing (and is not an error).
+    write_calls.clear()
+    builtins.input = lambda prompt="": "no"
     with tempfile.TemporaryDirectory() as tmpdir:
-        output_dir = Path(tmpdir)
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
-                sr.run_update(TW_CONFIG, MONDAY_CFG, output_dir, 2026, 8, refresh_teachworks_cache=False)
-            raise AssertionError("expected SystemExit for non-September-2026 update")
+                sr.run_update(TW_CONFIG, MONDAY_CFG, Path(tmpdir), 2026, 10, refresh_teachworks_cache=False)
+            raise AssertionError("expected SystemExit after a declined confirmation")
         except SystemExit as e:
-            assert e.code == 1
+            assert e.code == 0
         output = buf.getvalue()
-        assert "restricts writes to September 2026 ONLY" in output
-        assert calls_made == [], "must not touch Monday at all before the month check"
-        print("PASS: update mode refuses (year, month) != (2026, 9) before making any Monday call")
+        assert "restricts writes to September 2026" not in output
+        assert "Matched Monday item id='222' name='10 - October 2026'" in output
+        assert "Aborted -- nothing was written to Monday." in output
+        assert write_calls == []
+    print("PASS: October update previews the '10 - October 2026' item and writes nothing when not confirmed")
+
+    # 3b: confirming with YES writes October's fields, and only to the October item.
+    write_calls.clear()
+    builtins.input = lambda prompt="": "YES"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            sr.run_update(TW_CONFIG, MONDAY_CFG, Path(tmpdir), 2026, 10, refresh_teachworks_cache=False)
+        output = buf.getvalue()
+        assert {c["itemId"] for c in write_calls} == {"222"}
+        written_columns = {c["columnId"]: c["value"] for c in write_calls}
+        assert written_columns[MONDAY_CFG["column_sessions_attended"]] == "1"
+        assert written_columns[MONDAY_CFG["column_sessions_missed"]] == "1"
+        assert written_columns[MONDAY_CFG["column_total_sessions"]] == "2"
+        assert written_columns[MONDAY_CFG["column_students_served"]] == "2"
+        assert MONDAY_CFG["column_last_updated"] in written_columns
+        assert "Update complete." in output
+    builtins.input = orig_input
+    del LESSONS[-len(october_lessons):]
+    print("PASS: October update (after typed YES) writes October's KPI fields to the October item only")
 
     # =====================================================================
     # Test 4: update mode aborts cleanly on NOT_FOUND (no item named "September 2026") -- never creates one.

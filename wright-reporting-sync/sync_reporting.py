@@ -3,8 +3,9 @@
 aggregation). Phase 1: --mode dry-run (Teachworks-only, no Monday calls, kept
 working exactly as before). Phase 2 (new): --mode dry-run ALSO previews the
 exact Monday changes (read-only Monday queries, still zero writes) when a
-Monday config is available, and --mode update WRITES those fields to Monday
--- restricted to September 2026 only for Phase 2.
+Monday config is available, and --mode update WRITES those fields to the
+existing Monday item for the requested month (any month; the temporary
+September-2026-only restriction used during the historical repair is gone).
 
 Reuses audit.py for all Teachworks auth/pagination/caching, and reuses
 sync_monday.py's generic Monday GraphQL helpers (monday_graphql,
@@ -123,6 +124,41 @@ def read_cache_fetched_at(output_dir):
         return datetime.fromisoformat(meta["fetched_at"])
     except (KeyError, ValueError, OSError, json.JSONDecodeError):
         return None
+
+
+class StaleTeachworksSource(Exception):
+    """Raised when a run that requires freshly fetched Teachworks data got older data."""
+
+
+def load_teachworks_source(config, output_dir, refresh_teachworks_cache, require_fresh=False):
+    """The single place this script loads Teachworks students/lessons
+    (audit.load_or_fetch_all), so every run logs where its data came from:
+    FRESH (fetched by this run) or CACHE (an earlier run's files in
+    output_dir/_cache), with the fetch timestamp.
+
+    "Fresh" means the cache metadata's fetched_at is at or after the moment
+    this function started - i.e. this very run downloaded it. A cache from
+    any earlier run (even earlier the same day) is not fresh.
+
+    require_fresh=True (the --current-month production update) raises
+    StaleTeachworksSource instead of returning non-fresh data, so a month can
+    never again be written from an old snapshot."""
+    started_at = audit.datetime.now(timezone.utc)
+    students, students_pages, lessons, lessons_pages = audit.load_or_fetch_all(config, output_dir, refresh_teachworks_cache)
+    fetched_at = read_cache_fetched_at(output_dir)
+    fresh = fetched_at is not None and fetched_at >= started_at
+    when = fetched_at.isoformat() if fetched_at else "unknown (no cache metadata)"
+    if fresh:
+        print(f"Teachworks source: FRESH -- fetched by this run at {when} ({len(lessons)} lessons, {len(students)} students).")
+    else:
+        print(f"Teachworks source: CACHE -- loaded from {output_dir / '_cache'}, fetched at {when} "
+              f"({len(lessons)} lessons, {len(students)} students); NOT refreshed by this run.")
+    if require_fresh and not fresh:
+        raise StaleTeachworksSource(
+            f"Teachworks data was fetched at {when}, before this run started at {started_at.isoformat()}. "
+            "A current-month update only writes from Teachworks data fetched during the same run."
+        )
+    return students, students_pages, lessons, lessons_pages, {"fresh": fresh, "fetched_at": when}
 
 
 def check_data_freshness(output_dir, year, month):
@@ -261,7 +297,7 @@ def compute_reporting_result(config, output_dir, year, month, refresh_teachworks
     """Single source of truth for the Teachworks-side aggregation. Used
     IDENTICALLY by --mode dry-run (to preview it) and --mode update (to
     decide what to write), so the two can never disagree about the numbers."""
-    students, students_pages, lessons, lessons_pages = audit.load_or_fetch_all(
+    students, students_pages, lessons, lessons_pages, _source = load_teachworks_source(
         config, output_dir, refresh_teachworks_cache
     )
     print(f"\nUsing {len(lessons)} total lesson record(s) across {lessons_pages} page(s) of full history;")
@@ -912,13 +948,6 @@ def run_dry_run(config, output_dir, year, month, refresh_teachworks_cache, monda
 def run_update(config, monday_cfg, output_dir, year, month, refresh_teachworks_cache):
     print(f"=== Wright Academics Teachworks Reporting -- UPDATE ({year}-{month:02d}) ===")
 
-    if (year, month) != (2026, 9):
-        print(
-            f"\nPhase 2 restricts writes to September 2026 ONLY. Refusing to write {year}-{month:02d}. "
-            "Nothing was changed."
-        )
-        raise SystemExit(1)
-
     if not monday_cfg["api_token"]:
         print("\nMONDAY_API_TOKEN is not set in .env -- cannot write to Monday. Nothing was changed.")
         raise SystemExit(1)
@@ -994,13 +1023,11 @@ def run_trend_dry_run(config, output_dir, year, start_month, end_month, refresh_
     AND compute_monthly_financials, the exact same classification logic
     already validated for September (session-count logic is untouched; the
     financial numbers are a separate, independently-computed addition).
-    Makes NO Monday API calls at all; --mode update remains restricted to a
-    single month (September 2026) for session fields, and the multi-month
-    update path never touches any financial column."""
+    Makes NO Monday API calls at all."""
     print(f"=== Wright Academics Teachworks Reporting -- MONTHLY TREND ({year}-{start_month:02d} to {year}-{end_month:02d}) ===")
     print("Teachworks-only, read-only. No Monday API calls are made in this mode.\n")
 
-    students, students_pages, lessons, lessons_pages = audit.load_or_fetch_all(config, output_dir, refresh_teachworks_cache)
+    students, students_pages, lessons, lessons_pages, _source = load_teachworks_source(config, output_dir, refresh_teachworks_cache)
     print(f"\nUsing {len(lessons)} total lesson record(s) across {lessons_pages} page(s) of full history;")
     print("filtering to each month locally from this single Teachworks pull.\n")
 
@@ -1082,7 +1109,7 @@ def run_trend_dry_run(config, output_dir, year, start_month, end_month, refresh_
         print("!" * 70)
 
 
-def run_multi_update(config, monday_cfg, output_dir, year, start_month, end_month, refresh_teachworks_cache, allow_incomplete_month=False, skip_confirmation=False, auto_create_missing=False):
+def run_multi_update(config, monday_cfg, output_dir, year, start_month, end_month, refresh_teachworks_cache, allow_incomplete_month=False, skip_confirmation=False, auto_create_missing=False, require_fresh_source=False):
     """Multi-month historical backfill -- e.g. January-August 2026 -- and ALSO
     the engine behind --current-month (a 1-month range). Reuses the SAME
     Monday transport (sm.monday_graphql/fetch_all_monday_items/
@@ -1170,7 +1197,14 @@ def run_multi_update(config, monday_cfg, output_dir, year, start_month, end_mont
     print(f"Board-schema preflight OK -- all {len(required_column_keys)} configured column id(s) exist with the expected title/type.\n")
 
     # --- Compute every requested month from ONE Teachworks pull ---
-    students, students_pages, lessons, lessons_pages = audit.load_or_fetch_all(config, output_dir, refresh_teachworks_cache)
+    # A current-month (production) run must use data fetched during this run;
+    # an older cache is refused here, before any Monday item is read or written.
+    try:
+        students, students_pages, lessons, lessons_pages, _source = load_teachworks_source(
+            config, output_dir, refresh_teachworks_cache, require_fresh=require_fresh_source)
+    except StaleTeachworksSource as exc:
+        print(f"\nRefusing to write: {exc} Nothing was written to Monday.")
+        raise SystemExit(1)
     print(f"\nUsing {len(lessons)} total lesson record(s) across {lessons_pages} page(s) of full history;")
     print("filtering to each month locally from this single Teachworks pull.\n")
 
@@ -1433,7 +1467,7 @@ def main():
             "Wright Academics Teachworks Reporting board sync. 'dry-run' is always read-only "
             "(Teachworks aggregation + a Monday preview, no writes; add --month-range for a "
             "multi-month Teachworks-only trend table). 'update' WRITES to the matching Monday "
-            "item -- Phase 2 restricts this to September 2026 only."
+            "item for the requested month."
         )
     )
     parser.add_argument(
@@ -1442,8 +1476,8 @@ def main():
             "'dry-run': compute the Teachworks aggregation and preview the exact Monday changes "
             "(read-only, makes no writes). 'update': WRITES Sessions Attended/Missed, Total "
             "Sessions, Students Served, and Last Updated to the existing Monday item matching "
-            "this month's name -- never creates an item, restricted to September 2026 for Phase 2 "
-            "unless combined with --month-range for a multi-month historical backfill."
+            "this month's name -- never creates an item (only --current-month may create the "
+            "current month's item); combine with --month-range for a multi-month update."
         ),
     )
     parser.add_argument("--year", type=int, default=2026, help="Calendar year to aggregate (default 2026).")
@@ -1531,6 +1565,9 @@ def main():
         args.year = today.year
         args.month_range = f"{today.month}-{today.month}"
         args.allow_incomplete_month = True
+        # The current month changes every day, so a cached Teachworks pull is
+        # never valid for it: always re-fetch, whatever the command line says.
+        args.refresh_teachworks_cache = True
 
     output_dir = Path(args.output_dir) if args.output_dir else audit.SCRIPT_DIR / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1558,6 +1595,7 @@ def main():
                 config, monday_cfg, output_dir, args.year, start_month, end_month,
                 args.refresh_teachworks_cache, allow_incomplete_month=args.allow_incomplete_month,
                 skip_confirmation=args.yes, auto_create_missing=args.current_month,
+                require_fresh_source=args.current_month,
             )
         return
 

@@ -57,14 +57,19 @@ class FakeMonday:
     def __init__(self, names):
         self.items = {str(500 + i): make_item(str(500 + i), n) for i, n in enumerate(names)}
         self.creates, self.writes, self.group_lookups = [], [], 0
+        self.schema_omit = set()   # config keys whose column is missing from the live board
+        self.fail_writes = False   # every column write returns a Monday error
+        self.group_titles = ["2026"]
 
     def __call__(self, cfg, query, variables=None, max_retries=3):
         if query == sm.BOARD_COLUMNS_QUERY:
-            cols = [{"id": MONDAY_CFG[k], "title": t, "type": ty} for k, (t, ty) in sr.EXPECTED_REPORTING_COLUMNS.items()]
+            cols = [{"id": MONDAY_CFG[k], "title": t, "type": ty} for k, (t, ty) in sr.EXPECTED_REPORTING_COLUMNS.items()
+                    if k not in self.schema_omit]
             return {"boards": [{"id": MONDAY_CFG["board_id"], "name": "Teachworks Reporting", "columns": cols}]}
         if query == sr.BOARD_GROUPS_QUERY:
             self.group_lookups += 1
-            return {"boards": [{"id": MONDAY_CFG["board_id"], "groups": [{"id": "group_2026", "title": "2026"}]}]}
+            return {"boards": [{"id": MONDAY_CFG["board_id"],
+                                "groups": [{"id": f"group_{t}", "title": t} for t in self.group_titles]}]}
         if "items_page" in query and "next_items_page" not in query:
             return {"boards": [{"items_page": {"cursor": None, "items": list(self.items.values())}}]}
         if "create_item" in query:
@@ -73,6 +78,8 @@ class FakeMonday:
             self.items[new_id] = make_item(new_id, variables["itemName"])
             return {"create_item": {"id": new_id}}
         if "change_simple_column_value" in query:
+            if self.fail_writes:
+                raise sm.MondayApiError("simulated Monday write failure")
             self.writes.append(variables)
             item = self.items[str(variables["itemId"])]
             item["column_values"] = [c if c["id"] != variables["columnId"] else
@@ -89,7 +96,7 @@ class FakeMonday:
 def cli(monkeypatch, tmp_path):
     """Runs sync_reporting.main() end to end against a FakeMonday, pinned to a given 'today'."""
 
-    def run(argv, board_names, today):
+    def run(argv, board_names, today, confirm=None, configure=None):
         year, month = today
 
         class FakeDateTime(real_datetime_module.datetime):
@@ -106,12 +113,17 @@ def cli(monkeypatch, tmp_path):
             return ([l for m in range(1, 13) for l in lessons_for(year, m)] if page == 1 else []), R()
 
         monday = FakeMonday(board_names)
+        if configure:
+            configure(monday)
         monkeypatch.setattr(audit, "request_json", fake_request_json)
         monkeypatch.setattr(audit, "load_config", lambda: TW_CONFIG)
         monkeypatch.setattr(sr, "load_reporting_monday_config", lambda: MONDAY_CFG)
         monkeypatch.setattr(sm, "monday_graphql", monday)
         monkeypatch.setattr(sr, "datetime", FakeDateTime)
-        monkeypatch.setattr(builtins, "input", lambda prompt="": (_ for _ in ()).throw(AssertionError("stdin read")))
+        if confirm is None:
+            monkeypatch.setattr(builtins, "input", lambda prompt="": (_ for _ in ()).throw(AssertionError("stdin read")))
+        else:
+            monkeypatch.setattr(builtins, "input", lambda prompt="": confirm)
         out_dir = tmp_path / f"out-{len(list(tmp_path.iterdir()))}"
         monkeypatch.setattr(sys, "argv", ["sync_reporting.py"] + argv + ["--output-dir", str(out_dir)])
         buf, code = io.StringIO(), None

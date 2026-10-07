@@ -171,10 +171,11 @@ def test_current_month():
     real_run_multi_update = sr.run_multi_update
 
 
-    def spy_run_multi_update(config, monday_cfg, output_dir, year, start_month, end_month, refresh_teachworks_cache, allow_incomplete_month=False, skip_confirmation=False, auto_create_missing=False):
+    def spy_run_multi_update(config, monday_cfg, output_dir, year, start_month, end_month, refresh_teachworks_cache, allow_incomplete_month=False, skip_confirmation=False, auto_create_missing=False, require_fresh_source=False):
         captured_call.update(year=year, start_month=start_month, end_month=end_month,
                               allow_incomplete_month=allow_incomplete_month, skip_confirmation=skip_confirmation,
-                              auto_create_missing=auto_create_missing)
+                              auto_create_missing=auto_create_missing, refresh_teachworks_cache=refresh_teachworks_cache,
+                              require_fresh_source=require_fresh_source)
 
 
     sr.run_multi_update = spy_run_multi_update
@@ -186,6 +187,7 @@ def test_current_month():
     assert captured_call == {
         "year": CURRENT_YEAR, "start_month": CURRENT_MONTH, "end_month": CURRENT_MONTH,
         "allow_incomplete_month": True, "skip_confirmation": True, "auto_create_missing": True,
+        "refresh_teachworks_cache": True, "require_fresh_source": True,
     }, captured_call
     print(f"PASS: --current-month resolves to exactly year={CURRENT_YEAR} month={CURRENT_MONTH} (a single-month range), implies allow_incomplete_month AND auto_create_missing, passes skip_confirmation")
 
