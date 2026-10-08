@@ -88,7 +88,15 @@ at all.
 | `TEACHWORKS_API_KEY` | Yes | API key from the Teachworks account (Teachworks admin settings → API). |
 | `TEACHWORKS_BASE_URL` | No (default shown) | `https://api.teachworks.com/v1` |
 | `MONDAY_API_TOKEN` | Yes | A Monday.com API v2 token for a user/account that has access to both boards. Monday → Admin → API. |
-| `LOOKBACK_DAYS` | No (default `3`) | How many days back a normal scheduled run checks. |
+| `LOOKBACK_DAYS` | No (default `3`) | How many days back a plain `python sync.py` run checks (not used by `--daily-sync`). |
+| `RECONCILE_DAYS` | No (default `30`) | How many days back `--daily-sync` reconciles the Session Log against Teachworks. |
+| `RECONCILE_FLOOR_DATE` | No (default `2026-10-01`) | `--daily-sync` never reconciles before this date (earlier gaps need the baseline-aware repair, not the nightly). |
+| `RECONCILE_MAX_STALE_ROWS` | No (default `10`) | More rows than this not attended in Teachworks = Teachworks data treated as suspect; nothing is flagged and the run fails. |
+| `MONDAY_SESSION_COL_SYNC_FLAG` | No (unset) | Column id of an optional Session Log text column. Unset: rows no longer attended in Teachworks are only reported. Set: they are flagged there and excluded from student totals. |
+| `TEACHWORKS_REQUEST_DELAY_SECONDS` | No (default `0.5`) | Pause between the per-day Teachworks requests. |
+| `STUDENT_SYNC_CREATE` | No (default `false`) | `true` lets `--daily-sync` create missing Students board items. Otherwise it only reports who would be created. |
+| `MONDAY_STUDENTS_NEW_GROUP_ID` | For creation | Students board group new students are created in. |
+| `STUDENT_SYNC_MAX_CREATES` | No (default `25`) | More new students than this in one run = nothing created, run fails (review, then raise). |
 | `FULL_SYNC_START_DATE` | No (default `2020-01-01`) | Start date used by `--full`. Set this to whenever Wright's Teachworks data actually begins, to avoid scanning years of empty history. |
 | `REQUEST_TIMEOUT_SECONDS` | No (default `30`) | HTTP timeout per request. |
 | `MAX_RETRIES` | No (default `5`) | Retry attempts for transient (429/5xx/network) failures. |
@@ -512,13 +520,59 @@ Railway supports **Cron Schedules** on a service:
    hours after Wright's last lessons of the day, in UTC).
 3. Set the **Cron Command** to:
    ```
-   python sync.py
+   python sync.py --daily-sync
    ```
 4. Leave the regular Start Command unset/idle — the cron job runs the
    command on schedule instead of keeping a process alive.
 
 Do **not** put `--full` in the scheduled command — that's for manual,
 occasional reconciliation only.
+
+### What `--daily-sync` does each night
+
+0. **Students board roster.** Every Teachworks student (any status) is looked
+   up on the Students board by Teachworks Student ID. If missing, it is created
+   — name, Teachworks Student ID and Historical Session Baseline only, then
+   connected to its Session Log rows — **unless** anything could already be
+   that student: a Students item with a matching name (case, spacing,
+   punctuation, word order and middle names ignored; with or without a
+   Teachworks ID), another Teachworks student with a matching name, or no
+   usable name. Those are listed under "EXCEPTIONS" for a person to review;
+   nothing is created for them. Creation only happens with
+   `STUDENT_SYNC_CREATE=true` and `MONDAY_STUDENTS_NEW_GROUP_ID` set; onboarding,
+   contract, billing, family and communication fields are never touched.
+1. **Session Log reconciliation** over the last `RECONCILE_DAYS` (30) calendar
+   days through today (never before `RECONCILE_FLOOR_DATE`). Teachworks is the
+   source of truth; each attended participant session is identified by
+   `lesson_id` + Teachworks Student ID:
+   - attended in Teachworks, no Session Log row → the row is created (same
+     row builder and student connection as always);
+   - attended, one row → date, student name, tutor, type and location are
+     corrected if they drifted (a value Teachworks leaves blank is never
+     blanked on Monday; Duration/Amount are left as created; Pre-Baseline
+     rows are never edited); an unconnected row is connected once its
+     student exists;
+   - attended, several rows → reported as a duplicate, nothing changed;
+   - a row in the window that Teachworks no longer has as attended (status
+     changed, lesson deleted, participant removed) → **reported, never
+     deleted or archived**. Only if `MONDAY_SESSION_COL_SYNC_FLAG` is set is
+     a note written into that column (and cleared if Teachworks shows the
+     session attended again); flagged rows don't count in student totals.
+2. **Student rollup** — only if step 1 had no errors and no integrity
+   failure.
+
+Fail-safe: all Teachworks data is fetched before anything is written, and
+any Teachworks error (or a page that repeats/never ends) stops the run before
+the first write. A day with 3+ Session Log rows but no attended Teachworks
+session, or more stale rows than `RECONCILE_MAX_STALE_ROWS`, is an integrity
+failure: nothing is flagged, the rollup is skipped, the run exits 1.
+
+Running it twice against unchanged Teachworks data makes no changes the
+second time. Preview without writing anything:
+
+```
+python sync.py --daily-sync --dry-run
+```
 
 ## 13. Inspecting logs
 

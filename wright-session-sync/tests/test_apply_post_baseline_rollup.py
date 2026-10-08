@@ -13,7 +13,8 @@ from sync import apply_post_baseline_student_rollup_updates, run_post_baseline_r
 from tests.fakes import FakeMondayClient
 
 
-def _student(item_id, name, tw_id, baseline="0", session_count="", last_session="", tutor=""):
+def _student(item_id, name, tw_id, baseline="0", session_count="", last_session="", tutor="",
+             data_updated="2026-09-30"):
     return {
         "item_id": item_id,
         "item_name": name,
@@ -23,6 +24,7 @@ def _student(item_id, name, tw_id, baseline="0", session_count="", last_session=
             config.STUDENT_COL_SESSION_COUNT: session_count,
             config.STUDENT_COL_LAST_SESSION_DATE: last_session,
             config.STUDENT_COL_TUTOR: tutor,
+            config.STUDENT_COL_SESSION_DATA_LAST_SYNCED: data_updated,
         },
     }
 
@@ -78,23 +80,24 @@ def test_only_writes_students_whose_calculated_values_differ():
     assert monday.student_updates[0]["item_id"] == "s2"
 
 
-def test_write_touches_only_session_count_last_session_and_tutor():
+def test_write_touches_only_session_count_last_session_tutor_and_data_updated():
     monday = FakeMondayClient(
         student_items=[_student("s1", "Alice", "111", baseline="30", session_count="30",
                                  last_session="2026-09-10", tutor="Old Tutor")],
         items=[_session_row("i1", "100_111", "111", session_date="2026-09-14", tutor="New Tutor")],
     )
 
-    apply_post_baseline_student_rollup_updates(monday)
+    apply_post_baseline_student_rollup_updates(monday, today="2026-10-08")
 
     written_columns = monday.student_updates[0]["column_values"]
     assert set(written_columns.keys()) == {
         config.STUDENT_COL_SESSION_COUNT,
         config.STUDENT_COL_LAST_SESSION_DATE,
         config.STUDENT_COL_TUTOR,
+        config.STUDENT_COL_SESSION_DATA_LAST_SYNCED,
     }
     assert config.STUDENT_COL_FIRST_SESSION_DATE not in written_columns
-    assert config.STUDENT_COL_SESSION_DATA_LAST_SYNCED not in written_columns
+    assert written_columns[config.STUDENT_COL_SESSION_DATA_LAST_SYNCED] == {"date": "2026-10-08"}
     assert config.STUDENT_COL_HISTORICAL_BASELINE not in written_columns
     assert written_columns[config.STUDENT_COL_LAST_SESSION_DATE] == {"date": "2026-09-14"}
     assert written_columns[config.STUDENT_COL_TUTOR] == "New Tutor"
@@ -204,6 +207,7 @@ def test_rerunning_apply_twice_produces_zero_writes_on_second_run():
     monday.student_items[0]["columns"][config.STUDENT_COL_SESSION_COUNT] = str(written_columns[config.STUDENT_COL_SESSION_COUNT])
     monday.student_items[0]["columns"][config.STUDENT_COL_LAST_SESSION_DATE] = written_columns[config.STUDENT_COL_LAST_SESSION_DATE]["date"]
     monday.student_items[0]["columns"][config.STUDENT_COL_TUTOR] = written_columns[config.STUDENT_COL_TUTOR]
+    monday.student_items[0]["columns"][config.STUDENT_COL_SESSION_DATA_LAST_SYNCED] = written_columns[config.STUDENT_COL_SESSION_DATA_LAST_SYNCED]["date"]
     monday.student_updates = []  # isolate the second run's writes
 
     second_outcome = apply_post_baseline_student_rollup_updates(monday)
@@ -225,6 +229,7 @@ def test_rerunning_apply_twice_via_cli_wrapper_second_run_reports_zero_writes(ca
     monday.student_items[0]["columns"][config.STUDENT_COL_SESSION_COUNT] = str(written_columns[config.STUDENT_COL_SESSION_COUNT])
     monday.student_items[0]["columns"][config.STUDENT_COL_LAST_SESSION_DATE] = written_columns[config.STUDENT_COL_LAST_SESSION_DATE]["date"]
     monday.student_items[0]["columns"][config.STUDENT_COL_TUTOR] = written_columns[config.STUDENT_COL_TUTOR]
+    monday.student_items[0]["columns"][config.STUDENT_COL_SESSION_DATA_LAST_SYNCED] = written_columns[config.STUDENT_COL_SESSION_DATA_LAST_SYNCED]["date"]
     monday.student_updates = []
     capsys.readouterr()  # discard first run's output
 

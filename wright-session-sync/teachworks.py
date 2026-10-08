@@ -31,13 +31,22 @@ import requests
 
 logger = logging.getLogger("wright_sync.teachworks")
 
+# Teachworks returns at most 80 records per page no matter what per_page asks
+# for (confirmed: per_page=100 returns 80). Pagination must judge "last page"
+# against the size Teachworks actually serves, not the size requested.
+TEACHWORKS_MAX_PAGE_SIZE = 80
+
+# Safety stop for one day's pagination; a real day is 1-2 pages.
+MAX_PAGES_PER_DAY = 25
+
 
 class TeachworksAPIError(RuntimeError):
     """Raised when a Teachworks API call fails permanently (after retries)."""
 
 
 class TeachworksClient:
-    def __init__(self, api_key, base_url, timeout=30, max_retries=5, retry_base_delay=1.0, session=None):
+    def __init__(self, api_key, base_url, timeout=30, max_retries=5, retry_base_delay=1.0, session=None,
+                 request_delay_seconds=0.0):
         if not api_key:
             raise ValueError("Teachworks API key is required")
         self.api_key = api_key
@@ -46,6 +55,8 @@ class TeachworksClient:
         self.max_retries = max_retries
         self.retry_base_delay = retry_base_delay
         self.session = session or requests.Session()
+        # Pause between the per-day /lessons requests in get_lessons().
+        self.request_delay_seconds = request_delay_seconds
 
     def _auth_headers(self):
         # Confirmed against the known-working Zapier implementation.
@@ -70,7 +81,8 @@ class TeachworksClient:
             else:
                 if response.status_code == 200:
                     return response.json()
-                if response.status_code == 429 or response.status_code >= 500:
+                # Teachworks answers rate limiting with 403 "Rate Limit Exceeded", not only 429.
+                if response.status_code in (403, 429) or response.status_code >= 500:
                     last_error = TeachworksAPIError(
                         f"Teachworks returned {response.status_code}: {response.text[:500]}"
                     )
@@ -138,28 +150,42 @@ class TeachworksClient:
             yield current.isoformat()
             current += datetime.timedelta(days=1)
 
-    def _get_lessons_for_one_date(self, date_str, status, per_page):
-        """Fully paginate a SINGLE day's /lessons (from_date == to_date == date_str)."""
-        lessons = []
+    def _get_all_pages(self, path, params, per_page, label, max_pages=MAX_PAGES_PER_DAY):
+        """Every page of a list endpoint. A page is the last one when it is empty
+        or shorter than the page size Teachworks actually serves
+        (min(per_page, TEACHWORKS_MAX_PAGE_SIZE)); comparing against the
+        requested per_page alone stopped after the first 80 records. A page that
+        repeats the previous one, or more than max_pages full pages, raises
+        rather than return a partial list."""
+        full_page = min(per_page, TEACHWORKS_MAX_PAGE_SIZE)
+        records = []
+        previous_ids = None
         page = 1
         while True:
-            payload = self._get(
-                "/lessons",
-                params={
-                    "status": status,
-                    "from_date": date_str,
-                    "to_date": date_str,
-                    "page": page,
-                    "per_page": per_page,
-                },
-            )
+            if page > max_pages:
+                raise TeachworksAPIError(f"Teachworks {path} for {label} still returning full pages after {max_pages} pages")
+            payload = self._get(path, params={**params, "page": page, "per_page": per_page})
             page_records = self._extract_page(payload)
-            lessons.extend(page_records)
-            logger.debug("Fetched Teachworks lessons for %s page %d (%d records)", date_str, page, len(page_records))
-            if len(page_records) < per_page:
-                break
+            page_ids = [record.get("id") for record in page_records if isinstance(record, dict)]
+            if page_records and page_ids == previous_ids:
+                raise TeachworksAPIError(
+                    f"Teachworks {path} for {label} returned the same records for page {page - 1} and page {page}"
+                )
+            records.extend(page_records)
+            logger.debug("Fetched Teachworks %s for %s page %d (%d records)", path, label, page, len(page_records))
+            if len(page_records) < full_page:
+                return records
+            previous_ids = page_ids
             page += 1
-        return lessons
+
+    def _get_lessons_for_one_date(self, date_str, status, per_page):
+        """Fully paginate a SINGLE day's /lessons (from_date == to_date == date_str)."""
+        return self._get_all_pages(
+            "/lessons", {"status": status, "from_date": date_str, "to_date": date_str}, per_page, date_str)
+
+    def get_all_students(self, per_page=TEACHWORKS_MAX_PAGE_SIZE, max_pages=500):
+        """The full Teachworks student roster (GET /students, every status)."""
+        return self._get_all_pages("/students", {}, per_page, "all students", max_pages=max_pages)
 
     def get_lessons(self, start_date, end_date, status="Attended", per_page=100):
         """Fetch ALL lessons in [start_date, end_date] (inclusive).
@@ -176,7 +202,9 @@ class TeachworksClient:
         check in sync.run_sync, not here.
         """
         lessons = []
-        for date_str in self._iter_calendar_dates(start_date, end_date):
+        for index, date_str in enumerate(self._iter_calendar_dates(start_date, end_date)):
+            if index and self.request_delay_seconds:
+                time.sleep(self.request_delay_seconds)
             lessons.extend(self._get_lessons_for_one_date(date_str, status=status, per_page=per_page))
         return lessons
 

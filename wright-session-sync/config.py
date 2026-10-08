@@ -34,6 +34,25 @@ MONDAY_API_TOKEN = os.environ.get("MONDAY_API_TOKEN", "")
 
 LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "3"))
 
+# --daily-sync reconciles the Session Log against Teachworks for the last
+# RECONCILE_DAYS calendar days through today: creates attended sessions that
+# are missing, corrects drifted fields, and reports rows Teachworks no longer
+# has as attended. Re-checking an already-correct day changes nothing.
+RECONCILE_DAYS = int(os.environ.get("RECONCILE_DAYS", "30"))
+
+# The reconciliation window never starts before this date. Every session on or
+# after it is post-baseline, so creating it without Pre-Baseline (as the nightly
+# does) is correct; earlier gaps need the baseline-aware September repair.
+RECONCILE_FLOOR_DATE = os.environ.get("RECONCILE_FLOOR_DATE", "2026-10-01")
+
+# Integrity limit: if more Session Log rows than this in the window are not
+# attended in Teachworks, the Teachworks data is treated as suspect - nothing
+# is flagged and the run fails, instead of acting on a partial response.
+RECONCILE_MAX_STALE_ROWS = int(os.environ.get("RECONCILE_MAX_STALE_ROWS", "10"))
+
+# Pause between per-day Teachworks /lessons requests (~31 a night).
+TEACHWORKS_REQUEST_DELAY_SECONDS = float(os.environ.get("TEACHWORKS_REQUEST_DELAY_SECONDS", "0.5"))
+
 # Start date used for --full reconciliation. Configurable because "all of
 # history" means different things for different Teachworks accounts.
 FULL_SYNC_START_DATE = os.environ.get("FULL_SYNC_START_DATE", "2020-01-01")
@@ -86,6 +105,27 @@ STUDENT_COL_MILESTONES = "color_mm4c964d"
 # diagnose_baseline_migration() only.
 STUDENT_COL_HISTORICAL_BASELINE = "numeric_mm785914"
 COL_PRE_BASELINE = "boolean_mm78a02"
+
+# OPTIONAL, not yet created on the board. A text column on the Session Log
+# (e.g. "Teachworks Sync Flag"). While unset, Session Log rows that Teachworks
+# no longer has as attended are only REPORTED by --daily-sync. Once set, the
+# nightly writes a note into it for such rows (clears it if Teachworks shows
+# the session attended again), and the student rollup stops counting flagged
+# rows. Nothing is ever deleted or archived automatically.
+COL_TEACHWORKS_SYNC_FLAG = os.environ.get("MONDAY_SESSION_COL_SYNC_FLAG", "")
+
+# ---------------------------------------------------------------------------
+# Student roster sync (--daily-sync step 1)
+# ---------------------------------------------------------------------------
+# Every Teachworks student should have a Students board item (matched by
+# Teachworks Student ID). Creation is OFF until STUDENT_SYNC_CREATE=true: until
+# then every run (live or dry) only reports who WOULD be created.
+STUDENT_SYNC_CREATE = os.environ.get("STUDENT_SYNC_CREATE", "false").strip().lower() == "true"
+# Students board group new students are created in. Required for creation.
+MONDAY_STUDENTS_NEW_GROUP_ID = os.environ.get("MONDAY_STUDENTS_NEW_GROUP_ID", "")
+# More creations than this in one run = something is off (e.g. a roster or
+# board read problem): nothing is created and the run is flagged.
+STUDENT_SYNC_MAX_CREATES = int(os.environ.get("STUDENT_SYNC_MAX_CREATES", "25"))
 
 
 def validate():

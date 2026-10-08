@@ -1,24 +1,33 @@
 """Orchestration-level tests for --daily-sync (perform_daily_sync /
 run_daily_sync). These test the GLUE only: ordering, the step-1 success
-gate, and step-2 outcome handling. They monkeypatch sync.run_sync and
+gate, and step-2 outcome handling. They monkeypatch sync.reconcile_session_log and
 sync.apply_post_baseline_student_rollup_updates directly rather than
 exercising their full internal behavior - that behavior is already fully
-covered by test_sync.py and test_apply_post_baseline_rollup.py, and is
+covered by test_reconcile.py and test_apply_post_baseline_rollup.py, and is
 not re-tested here."""
 
+import pytest
+
 import sync
-from sync import SyncReport, perform_daily_sync, run_daily_sync
+from student_sync import StudentSyncReport
+from sync import ReconcileReport, perform_daily_sync, run_daily_sync
 
 
-def _report(creation_errors=None, missing_students=None, connection_errors=None):
-    return SyncReport(
-        mode="SCHEDULED (rolling lookback)",
+def _report(creation_errors=None, missing_students=None, connection_errors=None, integrity_failures=None):
+    return ReconcileReport(
         start_date="2026-09-13",
         end_date="2026-09-16",
-        creation_errors=creation_errors or [],
+        errors=[{"action": "create", **e} for e in (creation_errors or [])],
         missing_students=missing_students or [],
         connection_errors=connection_errors or [],
+        integrity_failures=integrity_failures or [],
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_student_roster(monkeypatch):
+    """Glue tests: the student step is covered by test_student_sync.py."""
+    monkeypatch.setattr(sync, "sync_students", lambda *a, **k: StudentSyncReport())
 
 
 def _rollup_outcome(failed=None):
@@ -42,7 +51,7 @@ def test_session_log_runs_before_rollups(monkeypatch):
         call_order.append("rollup")
         return _rollup_outcome()
 
-    monkeypatch.setattr(sync, "run_sync", fake_run_sync)
+    monkeypatch.setattr(sync, "reconcile_session_log", fake_run_sync)
     monkeypatch.setattr(sync, "apply_post_baseline_student_rollup_updates", fake_rollup)
 
     perform_daily_sync(object(), object(), "2026-09-13", "2026-09-16")
@@ -52,7 +61,7 @@ def test_session_log_runs_before_rollups(monkeypatch):
 
 def test_rollups_do_not_run_if_session_log_has_creation_errors(monkeypatch):
     rollup_called = []
-    monkeypatch.setattr(sync, "run_sync", lambda *a, **k: _report(
+    monkeypatch.setattr(sync, "reconcile_session_log", lambda *a, **k: _report(
         creation_errors=[{"unique_key": "100_1", "error": "boom"}]
     ))
     monkeypatch.setattr(sync, "apply_post_baseline_student_rollup_updates", lambda *a, **k: rollup_called.append(True))
@@ -71,7 +80,7 @@ def test_rollups_do_not_run_if_session_log_raises(monkeypatch):
     def boom(*args, **kwargs):
         raise RuntimeError("Teachworks is down")
 
-    monkeypatch.setattr(sync, "run_sync", boom)
+    monkeypatch.setattr(sync, "reconcile_session_log", boom)
     monkeypatch.setattr(sync, "apply_post_baseline_student_rollup_updates", lambda *a, **k: rollup_called.append(True))
 
     outcome = perform_daily_sync(object(), object(), "2026-09-13", "2026-09-16")
@@ -83,7 +92,7 @@ def test_rollups_do_not_run_if_session_log_raises(monkeypatch):
 
 
 def test_successful_session_log_proceeds_to_rollups_even_with_missing_students_and_connection_errors(monkeypatch):
-    monkeypatch.setattr(sync, "run_sync", lambda *a, **k: _report(
+    monkeypatch.setattr(sync, "reconcile_session_log", lambda *a, **k: _report(
         missing_students=[{"teachworks_student_id": "1", "student_name": "A", "lesson_id": "L1"}],
         connection_errors=[{"item_id": "i1", "error": "conn fail"}],
     ))
@@ -98,7 +107,7 @@ def test_successful_session_log_proceeds_to_rollups_even_with_missing_students_a
 
 
 def test_rollup_write_failures_return_nonzero_and_partial_failure(monkeypatch, capsys):
-    monkeypatch.setattr(sync, "run_sync", lambda *a, **k: _report())
+    monkeypatch.setattr(sync, "reconcile_session_log", lambda *a, **k: _report())
     monkeypatch.setattr(
         sync, "apply_post_baseline_student_rollup_updates",
         lambda *a, **k: _rollup_outcome(failed=[{"monday_item_id": "s1", "error": "write failed"}]),
@@ -112,7 +121,7 @@ def test_rollup_write_failures_return_nonzero_and_partial_failure(monkeypatch, c
 
 
 def test_rollup_exception_returns_nonzero_and_failure(monkeypatch, capsys):
-    monkeypatch.setattr(sync, "run_sync", lambda *a, **k: _report())
+    monkeypatch.setattr(sync, "reconcile_session_log", lambda *a, **k: _report())
 
     def boom(*args, **kwargs):
         raise RuntimeError("Monday API is down")
@@ -128,7 +137,7 @@ def test_rollup_exception_returns_nonzero_and_failure(monkeypatch, capsys):
 
 
 def test_creation_errors_produce_failure_and_nonzero_exit(monkeypatch, capsys):
-    monkeypatch.setattr(sync, "run_sync", lambda *a, **k: _report(
+    monkeypatch.setattr(sync, "reconcile_session_log", lambda *a, **k: _report(
         creation_errors=[{"unique_key": "100_1", "error": "boom"}]
     ))
     rollup_called = []
@@ -140,14 +149,14 @@ def test_creation_errors_produce_failure_and_nonzero_exit(monkeypatch, capsys):
     assert exit_code == 1
     assert rollup_called == []
     assert "FINAL RESULT: FAILURE" in out
-    assert "SKIPPED - Session Log sync did not succeed" in out
+    assert "SKIPPED - Session Log reconciliation did not succeed" in out
 
 
 def test_session_log_exception_produces_failure_and_nonzero_exit(monkeypatch, capsys):
     def boom(*args, **kwargs):
         raise RuntimeError("Teachworks is down")
 
-    monkeypatch.setattr(sync, "run_sync", boom)
+    monkeypatch.setattr(sync, "reconcile_session_log", boom)
     rollup_called = []
     monkeypatch.setattr(sync, "apply_post_baseline_student_rollup_updates", lambda *a, **k: rollup_called.append(True))
 
@@ -161,7 +170,7 @@ def test_session_log_exception_produces_failure_and_nonzero_exit(monkeypatch, ca
 
 
 def test_completely_successful_run_returns_zero(monkeypatch, capsys):
-    monkeypatch.setattr(sync, "run_sync", lambda *a, **k: _report())
+    monkeypatch.setattr(sync, "reconcile_session_log", lambda *a, **k: _report())
     monkeypatch.setattr(sync, "apply_post_baseline_student_rollup_updates", lambda *a, **k: _rollup_outcome())
 
     exit_code = run_daily_sync(object(), object(), "2026-09-13", "2026-09-16")
@@ -172,7 +181,7 @@ def test_completely_successful_run_returns_zero(monkeypatch, capsys):
 
 
 def test_missing_students_and_connection_errors_are_surfaced_but_not_blocking(monkeypatch, capsys):
-    monkeypatch.setattr(sync, "run_sync", lambda *a, **k: _report(
+    monkeypatch.setattr(sync, "reconcile_session_log", lambda *a, **k: _report(
         missing_students=[{"teachworks_student_id": "1", "student_name": "A", "lesson_id": "L1"}],
         connection_errors=[{"item_id": "i1", "error": "conn fail"}],
     ))
@@ -182,8 +191,8 @@ def test_missing_students_and_connection_errors_are_surfaced_but_not_blocking(mo
 
     out = capsys.readouterr().out
     assert exit_code == 0
-    assert "Missing students:               1" in out
-    assert "Connection errors:              1" in out
+    assert "Missing students (row created unconnected):   1" in out
+    assert "Connection errors:                            1" in out
     assert "FINAL RESULT: SUCCESS" in out
 
 
@@ -194,9 +203,35 @@ def test_cli_wires_daily_sync_flag(monkeypatch):
     monkeypatch.setattr(config_module, "MONDAY_API_TOKEN", "fake-token")
     monkeypatch.setattr(sync, "TeachworksClient", lambda **kwargs: object())
     monkeypatch.setattr(sync, "MondayClient", lambda **kwargs: object())
-    monkeypatch.setattr(sync, "run_sync", lambda *a, **k: _report())
+    monkeypatch.setattr(sync, "reconcile_session_log", lambda *a, **k: _report())
     monkeypatch.setattr(sync, "apply_post_baseline_student_rollup_updates", lambda *a, **k: _rollup_outcome())
 
     exit_code = sync.main(["--daily-sync"])
 
     assert exit_code == 0
+
+
+def test_integrity_failure_blocks_the_rollup_and_fails(monkeypatch, capsys):
+    monkeypatch.setattr(sync, "reconcile_session_log", lambda *a, **k: _report(
+        integrity_failures=["Teachworks returned no attended sessions for 2026-09-14"]))
+    rollup_called = []
+    monkeypatch.setattr(sync, "apply_post_baseline_student_rollup_updates", lambda *a, **k: rollup_called.append(True))
+
+    exit_code = run_daily_sync(object(), object(), "2026-09-13", "2026-09-16")
+
+    out = capsys.readouterr().out
+    assert exit_code == 1 and rollup_called == []
+    assert "INTEGRITY FAILURES (nothing flagged)" in out
+    assert "FINAL RESULT: FAILURE" in out
+
+
+def test_dry_run_never_runs_the_rollup(monkeypatch, capsys):
+    seen = []
+    monkeypatch.setattr(sync, "reconcile_session_log", lambda *a, **k: seen.append(k.get("dry_run")) or _report())
+    rollup_called = []
+    monkeypatch.setattr(sync, "apply_post_baseline_student_rollup_updates", lambda *a, **k: rollup_called.append(True))
+
+    exit_code = run_daily_sync(object(), object(), "2026-09-13", "2026-09-16", dry_run=True)
+
+    assert exit_code == 0 and seen == [True] and rollup_called == []
+    assert "FINAL RESULT: SUCCESS (dry run)" in capsys.readouterr().out

@@ -317,14 +317,31 @@ class MondayClient:
             })
         return results
 
+    def get_student_index(self, board_id, teachworks_id_column):
+        """Return (lookup, duplicates):
+          lookup     {teachworks_student_id: monday_item_id} for every Teachworks
+                     Student ID held by exactly ONE Student item;
+          duplicates {teachworks_student_id: [monday_item_id, ...]} for every ID
+                     held by more than one - never resolved to any of them.
+        Items with a blank Teachworks Student ID are skipped."""
+        items_by_id = {}
+        for item in self._iter_board_items(board_id, [teachworks_id_column]):
+            tw_id = self._column_text(item, teachworks_id_column).strip()
+            if tw_id:
+                items_by_id.setdefault(tw_id, []).append(item["id"])
+        lookup = {tw_id: ids[0] for tw_id, ids in items_by_id.items() if len(ids) == 1}
+        duplicates = {tw_id: ids for tw_id, ids in items_by_id.items() if len(ids) > 1}
+        return lookup, duplicates
+
     def get_student_lookup(self, board_id, teachworks_id_column):
         """Return {teachworks_student_id (str): monday_item_id (str)} for every
-        Student item that has a Teachworks Student ID populated."""
-        lookup = {}
-        for item in self._iter_board_items(board_id, [teachworks_id_column]):
-            tw_id = self._column_text(item, teachworks_id_column)
-            if tw_id:
-                lookup[tw_id] = item["id"]
+        Teachworks Student ID held by exactly one Student item. An ID shared by
+        several Student items is left out (and logged), so nothing is ever
+        connected to an arbitrary one of them."""
+        lookup, duplicates = self.get_student_index(board_id, teachworks_id_column)
+        for tw_id, item_ids in sorted(duplicates.items()):
+            logger.warning("DUPLICATE_STUDENT_ID teachworks_student_id=%s monday_item_ids=%s - not used for matching",
+                           tw_id, item_ids)
         return lookup
 
     def create_session_item(self, board_id, group_id, item_name, column_values):
@@ -347,6 +364,11 @@ class MondayClient:
         })
         return data["create_item"]["id"]
 
+    def create_student_item(self, board_id, group_id, item_name, column_values):
+        """Create one Students board item - same create_item mutation and
+        column encoding as create_session_item. Returns the new item's id."""
+        return self.create_session_item(board_id, group_id, item_name, column_values)
+
     def connect_student(self, board_id, item_id, column_id, student_item_id):
         """Set a board_relation column on an existing item to point at one student item."""
         mutation = """
@@ -364,6 +386,26 @@ class MondayClient:
             "value": value,
         })
         return data["change_column_value"]["id"]
+
+    def update_item_columns(self, board_id, item_id, column_values):
+        """Set several column values on an existing item in one
+        change_multiple_column_values mutation (same encoding as
+        create_session_item; None values are omitted, "" clears a text
+        column). Used by the Session Log reconciliation."""
+        clean_values = {k: v for k, v in column_values.items() if v is not None}
+        mutation = """
+        mutation ($boardId: ID!, $itemId: ID!, $columnValues: JSON!) {
+          change_multiple_column_values(board_id: $boardId, item_id: $itemId, column_values: $columnValues) {
+            id
+          }
+        }
+        """
+        data = self._execute(mutation, {
+            "boardId": str(board_id),
+            "itemId": str(item_id),
+            "columnValues": json.dumps(clean_values),
+        })
+        return data["change_multiple_column_values"]["id"]
 
     def update_student_columns(self, board_id, item_id, column_values):
         """Replace several column values on an EXISTING item in one mutation

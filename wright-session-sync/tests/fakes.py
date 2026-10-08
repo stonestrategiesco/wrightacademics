@@ -50,6 +50,9 @@ class FakeMondayClient:
     def get_student_lookup(self, board_id, teachworks_id_column):
         return dict(self.student_lookup)
 
+    def get_student_index(self, board_id, teachworks_id_column):
+        return dict(self.student_lookup), {}
+
     def create_session_item(self, board_id, group_id, item_name, column_values):
         if self.create_side_effect is not None:
             self.create_side_effect(column_values)

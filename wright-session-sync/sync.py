@@ -23,9 +23,41 @@ from dataclasses import dataclass, field
 
 import config
 from monday_client import MondayClient
+from student_sync import print_student_report, sync_students
 from teachworks import TeachworksClient
 
 logger = logging.getLogger("wright_sync")
+
+# Printed at the start of every run so the log shows which code is running.
+SYNC_VERSION = "session-sync 2026-10 rolling 30-day reconciliation"
+
+
+class DryRunWriteBlocked(BaseException):
+    """A Monday write was attempted during --dry-run. BaseException, so no
+    `except Exception` handler on the way up can swallow it."""
+
+
+_WRITE_METHODS = ("create_session_item", "create_student_item", "connect_student", "update_item_columns",
+                  "update_student_columns")
+
+
+def make_read_only(monday_client):
+    """Turn this MondayClient into a read-only one for --dry-run: every write
+    method, and any GraphQL request containing a mutation, raises
+    DryRunWriteBlocked before anything is sent. Applies to every command."""
+    for name in _WRITE_METHODS:
+        def blocked(*_args, _name=name, **_kwargs):
+            raise DryRunWriteBlocked(f"--dry-run: blocked MondayClient.{_name}()")
+        setattr(monday_client, name, blocked)
+    original_execute = getattr(monday_client, "_execute", None)
+    if original_execute is not None:   # every real MondayClient request goes through _execute
+        def read_only_execute(query, variables=None):
+            if "mutation" in query.lower():
+                raise DryRunWriteBlocked("--dry-run: blocked a Monday GraphQL mutation")
+            return original_execute(query, variables)
+
+        monday_client._execute = read_only_execute
+    return monday_client
 
 # A lesson date confirmed (via --diagnose-teachworks against the real API) to
 # have at least one Attended record, used as a known-good fixture when
@@ -1485,7 +1517,7 @@ def _group_post_baseline_session_log_rows_by_student(session_log_items):
     Does not call or modify _group_session_log_rows_by_student()."""
     post_baseline_items = [
         item for item in session_log_items
-        if not (item["columns"].get(config.COL_PRE_BASELINE) or "").strip()
+        if not (item["columns"].get(config.COL_PRE_BASELINE) or "").strip() and not _is_flagged(item)
     ]
 
     deduped = {}
@@ -1863,11 +1895,15 @@ def compute_post_baseline_student_rollup_updates(monday_client):
         student (blank unique_key, blank Teachworks Student ID, or blank
         Session Date),
     }."""
-    session_log_items = monday_client.get_items(config.MONDAY_SESSIONS_BOARD_ID, _POST_BASELINE_ROLLUP_SOURCE_COLUMNS)
+    source_columns = list(_POST_BASELINE_ROLLUP_SOURCE_COLUMNS)
+    if config.COL_TEACHWORKS_SYNC_FLAG:
+        # Rows flagged "not attended in Teachworks" by the reconciliation never count.
+        source_columns.append(config.COL_TEACHWORKS_SYNC_FLAG)
+    session_log_items = monday_client.get_items(config.MONDAY_SESSIONS_BOARD_ID, source_columns)
 
     post_baseline_items = [
         item for item in session_log_items
-        if not (item["columns"].get(config.COL_PRE_BASELINE) or "").strip()
+        if not (item["columns"].get(config.COL_PRE_BASELINE) or "").strip() and not _is_flagged(item)
     ]
     identity_counts = {}
     missing_identity_rows = 0
@@ -1888,21 +1924,35 @@ def compute_post_baseline_student_rollup_updates(monday_client):
         config.STUDENT_COL_SESSION_COUNT,
         config.STUDENT_COL_LAST_SESSION_DATE,
         config.STUDENT_COL_TUTOR,
+        config.STUDENT_COL_SESSION_DATA_LAST_SYNCED,
     ]
     student_items = monday_client.get_items(config.MONDAY_STUDENTS_BOARD_ID, student_columns)
+
+    # A student is only updated when its Teachworks Student ID is a valid
+    # (numeric) ID held by no other Students item. Blank, invalid and
+    # duplicated IDs are unmatched: no count and no timestamp write.
+    def _tw_id(item):
+        return (item["columns"].get(config.STUDENT_BOARD_COL_TEACHWORKS_ID) or "").strip()
+
+    id_counts = {}
+    for item in student_items:
+        id_counts[_tw_id(item)] = id_counts.get(_tw_id(item), 0) + 1
 
     results = []
     for item in student_items:
         cols = item["columns"]
-        tw_id = cols.get(config.STUDENT_BOARD_COL_TEACHWORKS_ID)
+        tw_id = _tw_id(item)
         student_name = item.get("item_name") or "(unnamed)"
 
-        if not tw_id:
+        if not tw_id.isdigit() or id_counts[tw_id] > 1:
             results.append({
                 "monday_item_id": item["item_id"],
                 "student_name": student_name,
-                "teachworks_student_id": None,
+                "teachworks_student_id": tw_id or None,
                 "matched": False,
+                "skip_reason": ("no Teachworks Student ID" if not tw_id
+                                else f"invalid Teachworks Student ID {tw_id!r}" if not tw_id.isdigit()
+                                else f"Teachworks Student ID {tw_id} is on {id_counts[tw_id]} Students items"),
             })
             continue
 
@@ -1920,6 +1970,7 @@ def compute_post_baseline_student_rollup_updates(monday_client):
 
         current_last_session = cols.get(config.STUDENT_COL_LAST_SESSION_DATE) or ""
         current_tutor = cols.get(config.STUDENT_COL_TUTOR) or ""
+        current_data_updated = (cols.get(config.STUDENT_COL_SESSION_DATA_LAST_SYNCED) or "")[:10]
 
         post_baseline_rows = rows_by_student.get(tw_id, [])
         proposed_count = historical_baseline + len(post_baseline_rows)
@@ -1949,6 +2000,7 @@ def compute_post_baseline_student_rollup_updates(monday_client):
             "proposed_last_session": proposed_last_session or "(blank)",
             "current_tutor": current_tutor or "(blank)",
             "proposed_tutor": proposed_tutor or "(blank)",
+            "current_data_updated": current_data_updated or "(blank)",
         })
 
     return {
@@ -1975,6 +2027,7 @@ def run_post_baseline_rollup_dry_run(monday_client, sample_size=25):
 
     baseline_total = sum(r["historical_baseline"] for r in matched)
     differs = [r for r in matched if r["proposed_count"] != r["current_count"]]
+    catch_up = [r for r in matched if not _session_values_differ(r) and _data_updated_is_stale(r)]
     missing_matches = len(unmatched) + outcome["missing_identity_rows"]
 
     print("\n--- SUMMARY ---")
@@ -1982,9 +2035,12 @@ def run_post_baseline_rollup_dry_run(monday_client, sample_size=25):
     print(f"Historical baseline total (across matched students): {baseline_total}")
     print(f"Distinct post-baseline sessions: {outcome['distinct_post_baseline_sessions']}")
     print(f"Students whose calculated Session Count differs from Monday: {len(differs)}")
+    print(f"Students whose Session Data Last Synced would only be caught up (blank/older than Last Session Date): {len(catch_up)}")
     print(f"Duplicate physical rows collapsed by canonical identity: {outcome['duplicate_rows_collapsed']}")
     print(f"Missing identity/student matches: {missing_matches}")
-    print(f"  (unmatched students - blank Teachworks Student ID: {len(unmatched)})")
+    print(f"  (unmatched students - blank, invalid or duplicated Teachworks Student ID: {len(unmatched)})")
+    for r in sorted(unmatched, key=lambda r: r["student_name"]):
+        print(f"    Monday item {r['monday_item_id']} ({r['student_name']}): {r['skip_reason']} - not updated")
     print(f"  (Session Log rows missing identity/student/date info: {outcome['missing_identity_rows']})")
 
     if differs:
@@ -1994,6 +2050,7 @@ def run_post_baseline_rollup_dry_run(monday_client, sample_size=25):
             print(f"  Session Count:      {r['current_count']} -> {r['proposed_count']}")
             print(f"  Last Session Date:  {r['current_last_session']} -> {r['proposed_last_session']}")
             print(f"  Tutor:              {r['current_tutor']} -> {r['proposed_tutor']}")
+            print(f"  Session Data Last Synced: {r['current_data_updated']} -> (run date)")
 
     print("\n" + "=" * 70)
     print("DIAGNOSTIC COMPLETE - read-only. Zero Monday writes were made.")
@@ -2001,7 +2058,25 @@ def run_post_baseline_rollup_dry_run(monday_client, sample_size=25):
     return 0
 
 
-def apply_post_baseline_student_rollup_updates(monday_client):
+def _session_values_differ(r):
+    return (
+        r["proposed_count"] != r["current_count"]
+        or r["proposed_last_session"] != r["current_last_session"]
+        or r["proposed_tutor"] != r["current_tutor"]
+    )
+
+
+def _data_updated_is_stale(r):
+    """Session Data Last Synced ("when this student's session data last
+    changed") is blank or older than their Last Session Date - left behind
+    when the nightly didn't yet maintain it. Caught up once; never again
+    after, since it is then on/after the last session date."""
+    last_session = _real_or_none(r["proposed_last_session"])
+    current = _real_or_none(r.get("current_data_updated"))
+    return bool(last_session) and (current is None or current < last_session)
+
+
+def apply_post_baseline_student_rollup_updates(monday_client, today=None):
     """Performs the REAL Monday writes for the baseline+SET rollup
     calculated by compute_post_baseline_student_rollup_updates() - reused
     exactly as-is, no second calculation path. Unmatched students (blank
@@ -2025,6 +2100,13 @@ def apply_post_baseline_student_rollup_updates(monday_client):
     path) to translate the '(blank)' display sentinel back to None rather
     than ever writing that literal string.
 
+    Session Data Last Synced is set to `today` (the run date) in that same
+    mutation, so it records when the student's session data last actually
+    changed - never on a student whose data didn't change, so a rerun still
+    writes nothing. One-time catch-up: a student whose Session Data Last
+    Synced is blank or older than their Last Session Date also gets it set
+    (see _data_updated_is_stale), and nothing else changes for them.
+
     One student's write failure is logged and does NOT stop the remaining
     students from being processed.
 
@@ -2034,6 +2116,7 @@ def apply_post_baseline_student_rollup_updates(monday_client):
     _group_session_log_rows_by_student(),
     compute_student_rollup_updates(), apply_baseline_migration(), or
     _canonical_session_identity()/_group_post_baseline_session_log_rows_by_student()."""
+    today = today or datetime.date.today().isoformat()
     outcome = compute_post_baseline_student_rollup_updates(monday_client)
     results = outcome["results"]
 
@@ -2047,21 +2130,22 @@ def apply_post_baseline_student_rollup_updates(monday_client):
             skipped_unmatched.append(r)
             continue
 
-        differs = (
-            r["proposed_count"] != r["current_count"]
-            or r["proposed_last_session"] != r["current_last_session"]
-            or r["proposed_tutor"] != r["current_tutor"]
-        )
-        if not differs:
+        values_differ = _session_values_differ(r)
+        if not values_differ and not _data_updated_is_stale(r):
             unchanged.append(r)
             continue
 
-        last_session = _real_or_none(r["proposed_last_session"])
-        column_values = {
-            config.STUDENT_COL_SESSION_COUNT: r["proposed_count"],
-            config.STUDENT_COL_LAST_SESSION_DATE: {"date": last_session} if last_session else None,
-            config.STUDENT_COL_TUTOR: _real_or_none(r["proposed_tutor"]),
-        }
+        r["proposed_data_updated"] = today
+        if values_differ:
+            last_session = _real_or_none(r["proposed_last_session"])
+            column_values = {
+                config.STUDENT_COL_SESSION_COUNT: r["proposed_count"],
+                config.STUDENT_COL_LAST_SESSION_DATE: {"date": last_session} if last_session else None,
+                config.STUDENT_COL_TUTOR: _real_or_none(r["proposed_tutor"]),
+                config.STUDENT_COL_SESSION_DATA_LAST_SYNCED: {"date": today},
+            }
+        else:   # catch-up only: nothing else changes for this student
+            column_values = {config.STUDENT_COL_SESSION_DATA_LAST_SYNCED: {"date": today}}
         try:
             monday_client.update_student_columns(config.MONDAY_STUDENTS_BOARD_ID, r["monday_item_id"], column_values)
         except Exception as exc:  # noqa: BLE001 - one bad student must not stop the run
@@ -2106,7 +2190,7 @@ def run_post_baseline_rollup_apply(monday_client):
     if outcome["skipped_unmatched"]:
         print(f"\nSkipped (cannot be matched, no write): {len(outcome['skipped_unmatched'])}")
         for r in sorted(outcome["skipped_unmatched"], key=lambda r: r["student_name"]):
-            print(f"  Monday item {r['monday_item_id']} ({r['student_name']}): no Teachworks Student ID")
+            print(f"  Monday item {r['monday_item_id']} ({r['student_name']}): {r['skip_reason']}")
 
     if outcome["failed"]:
         print(f"\nFAILED writes: {len(outcome['failed'])}")
@@ -2196,56 +2280,376 @@ def run_student_rollup_dry_run(monday_client, today=None):
     return 0
 
 
-def perform_daily_sync(tw_client, monday_client, start_date, end_date):
-    """Smallest possible orchestration of the two already-proven,
-    independently-tested steps, run in order:
+# ---------------------------------------------------------------------------
+# Rolling Session Log reconciliation (--daily-sync)
+# ---------------------------------------------------------------------------
+# Teachworks is the source of truth. For every attended participant session
+# in the window, identified by (lesson_id, Teachworks Student ID) - the same
+# canonical identity as the rollup - the Session Log must hold exactly one
+# row with the same date/student/tutor/type/location. Rows in the window that
+# Teachworks no longer has as attended are reported (and, only once
+# COL_TEACHWORKS_SYNC_FLAG is configured, flagged) - never deleted or archived.
 
-    1. run_sync() - the locked Teachworks -> Session Log pipeline, called
-       exactly as the standalone scheduled command calls it (mode=
-       "SCHEDULED (rolling lookback)", dry_run=False).
-    2. IF AND ONLY IF step 1 succeeds,
-       apply_post_baseline_student_rollup_updates() - the baseline+SET
-       student rollup apply, exactly as already built and tested.
+# Fields kept in step with Teachworks on existing rows. Duration and Amount are
+# left as created: their Teachworks fields are still unconfirmed (teachworks.py).
+_RECONCILED_FIELDS = [
+    ("session_date", config.COL_SESSION_DATE),
+    ("student_name", config.COL_STUDENT_NAME),
+    ("tutor", config.COL_TUTOR),
+    ("service", config.COL_SERVICE),
+    ("location", config.COL_LOCATION),
+]
 
-    Neither function's business logic is duplicated or modified here -
-    both are called exactly as-is.
+STALE_FLAG_TEXT = "Not attended in Teachworks (flagged {date})"
 
-    Step 1's success gate matches the existing standalone Session Log
-    command's own semantics (see main(): `return 1 if report.creation_errors
-    else 0`), not a new or stricter rule: run_sync() must return without
-    raising, AND report.creation_errors must be empty.
-    report.missing_students and report.connection_errors are surfaced in
-    the returned dict but do NOT block step 2, and Session Log behavior
-    itself is unchanged either way.
+# A day with at least this many Session Log rows but no attended Teachworks
+# session is treated as a failed/partial Teachworks response, not a real change.
+# (One or two cancelled sessions on a quiet day are just reported as stale.)
+EMPTY_DAY_INTEGRITY_MIN_ROWS = 3
 
-    Returns a dict:
-      "sync_report": the SyncReport from run_sync(), or None if it raised
-        before returning one.
-      "sync_exception": the exception run_sync() raised, or None.
-      "sync_succeeded": bool - whether step 1's gate passed.
-      "rollup_ran": bool - whether step 2 was attempted at all.
-      "rollup_outcome": the dict from
-        apply_post_baseline_student_rollup_updates(), or None if step 2
-        did not run or raised before returning one.
-      "rollup_exception": the exception step 2 raised, or None.
-    """
+
+def _reconcile_columns():
+    columns = [config.COL_UNIQUE_ID, config.COL_TEACHWORKS_STUDENT_ID, config.COL_SESSION_DATE,
+               config.COL_STUDENT_NAME, config.COL_TUTOR, config.COL_SERVICE, config.COL_LOCATION,
+               config.COL_STUDENT_CONNECTION, config.COL_PRE_BASELINE]
+    if config.COL_TEACHWORKS_SYNC_FLAG:
+        columns.append(config.COL_TEACHWORKS_SYNC_FLAG)
+    return columns
+
+
+def _is_flagged(item):
+    return bool(config.COL_TEACHWORKS_SYNC_FLAG
+                and (item["columns"].get(config.COL_TEACHWORKS_SYNC_FLAG) or "").strip())
+
+
+def _is_pre_baseline(item):
+    return bool((item["columns"].get(config.COL_PRE_BASELINE) or "").strip())
+
+
+def _row_date(item):
+    return (item["columns"].get(config.COL_SESSION_DATE) or "")[:10]
+
+
+def _text(value):
+    return "" if value is None else str(value).strip()
+
+
+def reconcile_window(today, days, floor_date):
+    """(start, end): the last `days` calendar days through today, never before
+    floor_date. Plain date arithmetic - month/year boundaries need nothing special."""
+    start = max((today - datetime.timedelta(days=days)).isoformat(), floor_date)
+    return start, today.isoformat()
+
+
+@dataclass
+class ReconcileReport:
+    start_date: str
+    end_date: str
+    dry_run: bool = False
+    runtime_seconds: float = 0.0
+    teachworks_lessons: int = 0
+    teachworks_sessions: int = 0          # distinct attended participant sessions examined
+    monday_rows_read: int = 0             # every active Session Log row
+    monday_rows_in_window: int = 0
+    already_correct: int = 0
+    created: list = field(default_factory=list)
+    updated: list = field(default_factory=list)
+    connected: list = field(default_factory=list)
+    stale: list = field(default_factory=list)
+    flagged: list = field(default_factory=list)
+    unflagged: list = field(default_factory=list)
+    duplicates: list = field(default_factory=list)
+    ambiguous: list = field(default_factory=list)
+    unidentifiable_rows: list = field(default_factory=list)
+    missing_students: list = field(default_factory=list)
+    # Teachworks Student IDs held by more than one Students item: their sessions
+    # are created/kept but never connected to either item - for manual review.
+    duplicate_student_ids: list = field(default_factory=list)
+    errors: list = field(default_factory=list)              # failed creates/updates/flags - block the rollup
+    connection_errors: list = field(default_factory=list)   # reported, not blocking (as before)
+    integrity_failures: list = field(default_factory=list)  # suspect Teachworks data - nothing flagged
+    attended_rows: int = 0                 # distinct Teachworks-attended sessions with a Session Log row
+
+    @property
+    def succeeded(self):
+        return not self.errors and not self.integrity_failures
+
+
+def reconcile_session_log(tw_client, monday_client, start_date, end_date, dry_run=False, today=None):
+    """Reconcile the Session Log against Teachworks for [start_date, end_date].
+
+    Order of work, so a failed read never leads to a write:
+      1. Read Teachworks for every day in the window (any error raises here,
+         before anything is written; pagination raises rather than truncate).
+      2. Read the whole Session Log and the Student lookup.
+      3. Integrity checks on the Teachworks result.
+      4. Attended in Teachworks, no row -> create it (production row builder,
+         Pre-Baseline unset), connect the student; exactly one row -> correct
+         drifted fields / connect / clear a flag; more than one -> report as
+         duplicate, change nothing.
+      5. Rows in the window not attended in Teachworks -> report; flag only when
+         COL_TEACHWORKS_SYNC_FLAG is configured and every integrity check passed.
+
+    Idempotent: a second run against unchanged Teachworks data finds every
+    session present and every field equal, so it writes nothing."""
+    import time as _time
+
+    started_at = _time.time()
+    today = today or datetime.date.today()
+    report = ReconcileReport(start_date=start_date, end_date=end_date, dry_run=dry_run)
+
+    # 1. Teachworks
+    logger.info("Fetching Teachworks attended lessons for %s .. %s ...", start_date, end_date)
+    lessons = tw_client.get_lessons(start_date, end_date)
+    report.teachworks_lessons = len(lessons)
+    sessions = {}
+    for session in tw_client.extract_attended_sessions(lessons):
+        identity = (str(session.get("lesson_id")), str(session.get("student_id")))
+        sessions.setdefault(identity, session)
+    report.teachworks_sessions = len(sessions)
+
+    # 2. Monday
+    items = monday_client.get_items(config.MONDAY_SESSIONS_BOARD_ID, _reconcile_columns())
+    report.monday_rows_read = len(items)
+    student_lookup, duplicate_students = monday_client.get_student_index(
+        config.MONDAY_STUDENTS_BOARD_ID, config.STUDENT_BOARD_COL_TEACHWORKS_ID)
+    duplicate_sessions = {}
+
+    by_identity = {}
+    for item in items:
+        identity = _canonical_session_identity(item)
+        if identity[0] is None:
+            continue
+        by_identity.setdefault((str(identity[0]), str(identity[1])), []).append(item)
+    # Unique IDs on rows whose identity cannot be derived (blank Teachworks Student
+    # ID): a session whose key or bare lesson id is among them is never created.
+    unidentified_keys = {
+        (item["columns"].get(config.COL_UNIQUE_ID) or "").strip()
+        for item in items if _canonical_session_identity(item)[0] is None
+    } - {""}
+
+    window_rows = [item for item in items if start_date <= _row_date(item) <= end_date]
+    report.monday_rows_in_window = len(window_rows)
+
+    # 3. Integrity: a day with several Session Log rows but no attended Teachworks
+    # session looks like a failed/partial Teachworks response, not a real change.
+    tw_days = {s.get("session_date") for s in sessions.values()}
+    rows_by_day = {}
+    for item in window_rows:
+        if not _is_pre_baseline(item) and not _is_flagged(item):
+            rows_by_day[_row_date(item)] = rows_by_day.get(_row_date(item), 0) + 1
+    for day, count in sorted(rows_by_day.items()):
+        if day not in tw_days and count >= EMPTY_DAY_INTEGRITY_MIN_ROWS:
+            report.integrity_failures.append(
+                f"Teachworks returned no attended sessions for {day}, but the Session Log has {count} row(s) that day")
+
+    # 4. Every attended Teachworks session
+    for identity, session in sorted(sessions.items(), key=lambda kv: (kv[1].get("session_date") or "", kv[0])):
+        rows = by_identity.get(identity, [])
+        student_item_id = student_lookup.get(identity[1])   # None for a duplicated ID: never connected
+        if identity[1] in duplicate_students:
+            duplicate_sessions.setdefault(identity[1], []).append(session["unique_key"])
+        if len(rows) > 1:
+            report.duplicates.append({"identity": identity, "item_ids": [r["item_id"] for r in rows]})
+            logger.warning("DUPLICATE identity=%s_%s item_ids=%s", identity[0], identity[1], [r["item_id"] for r in rows])
+            continue
+        if not rows:
+            if session["unique_key"] in unidentified_keys or identity[0] in unidentified_keys:
+                report.ambiguous.append({"identity": identity, "session_date": session.get("session_date")})
+                logger.warning("AMBIGUOUS identity=%s_%s - a Session Log row with this key has no Teachworks Student ID; not created",
+                               identity[0], identity[1])
+                continue
+            _reconcile_create(monday_client, report, session, student_item_id, dry_run,
+                              ambiguous_student=identity[1] in duplicate_students)
+            continue
+        _reconcile_existing(monday_client, report, rows[0], session, student_item_id, dry_run)
+
+    for tw_id, unique_keys in sorted(duplicate_sessions.items()):
+        report.duplicate_student_ids.append({"teachworks_id": tw_id, "item_ids": duplicate_students[tw_id],
+                                             "sessions": unique_keys})
+        logger.warning("DUPLICATE_STUDENT_ID teachworks_student_id=%s monday_item_ids=%s sessions_not_connected=%s",
+                       tw_id, duplicate_students[tw_id], unique_keys)
+
+    # 5. Rows in the window Teachworks no longer has as attended
+    for item in sorted(window_rows, key=lambda i: (_row_date(i), i["item_id"])):
+        if _is_pre_baseline(item):
+            continue
+        identity = _canonical_session_identity(item)
+        if identity[0] is None:
+            report.unidentifiable_rows.append(_row_summary(item))
+            continue
+        if (str(identity[0]), str(identity[1])) in sessions:
+            continue
+        report.stale.append({**_row_summary(item), "flagged": _is_flagged(item)})
+        logger.warning("NOT_ATTENDED_IN_TEACHWORKS item_id=%s unique_key=%s date=%s student=%s",
+                       item["item_id"], item["columns"].get(config.COL_UNIQUE_ID), _row_date(item),
+                       item["columns"].get(config.COL_STUDENT_NAME))
+    if len(report.stale) > config.RECONCILE_MAX_STALE_ROWS:
+        report.integrity_failures.append(
+            f"{len(report.stale)} Session Log rows in the window are not attended in Teachworks "
+            f"(limit {config.RECONCILE_MAX_STALE_ROWS}) - Teachworks data treated as suspect")
+    if config.COL_TEACHWORKS_SYNC_FLAG and not report.integrity_failures:
+        note = STALE_FLAG_TEXT.format(date=today.isoformat())
+        for row in report.stale:
+            if row["flagged"]:
+                continue
+            if not dry_run:
+                try:
+                    monday_client.update_item_columns(config.MONDAY_SESSIONS_BOARD_ID, row["item_id"],
+                                                      {config.COL_TEACHWORKS_SYNC_FLAG: note})
+                except Exception as exc:  # noqa: BLE001 - one bad row must not kill the run
+                    logger.error("FLAG_ERROR item_id=%s error=%s", row["item_id"], exc)
+                    report.errors.append({"action": "flag", "item_id": row["item_id"], "error": str(exc)})
+                    continue
+            report.flagged.append(row)
+
+    # Distinct attended Teachworks sessions that have a Session Log row after this
+    # run (in a dry run: would have). Rows not attended in Teachworks never count.
+    matched = {identity for identity in sessions if by_identity.get(identity)}
+    matched |= {c["identity"] for c in report.created}
+    report.attended_rows = len(matched)
+    report.runtime_seconds = _time.time() - started_at
+    return report
+
+
+def _row_summary(item):
+    cols = item["columns"]
+    return {"item_id": item["item_id"], "unique_key": cols.get(config.COL_UNIQUE_ID) or "",
+            "session_date": _row_date(item), "student_name": cols.get(config.COL_STUDENT_NAME) or item.get("item_name") or "",
+            "tutor": cols.get(config.COL_TUTOR) or ""}
+
+
+def _reconcile_create(monday_client, report, session, student_item_id, dry_run, ambiguous_student=False):
+    identity = (str(session.get("lesson_id")), str(session.get("student_id")))
+    created = {"identity": identity, "unique_key": session["unique_key"], "session_date": session.get("session_date"),
+               "student_name": session.get("student_name"), "tutor": session.get("tutor"), "service": session.get("service")}
+    if not student_item_id and not ambiguous_student:   # duplicated IDs are reported separately
+        report.missing_students.append(created)
+        logger.warning("MISSING_STUDENT teachworks_student_id=%s student_name=%s lesson_id=%s",
+                       identity[1], session.get("student_name"), identity[0])
+    if dry_run:
+        report.created.append(created)
+        return
+    try:
+        item_id = monday_client.create_session_item(
+            config.MONDAY_SESSIONS_BOARD_ID, config.MONDAY_SESSION_GROUP_ID,
+            _build_item_name(session), _build_column_values(session),
+        )
+    except Exception as exc:  # noqa: BLE001 - one bad record must not kill the run
+        logger.error("CREATE_ERROR unique_key=%s error=%s", session["unique_key"], exc)
+        report.errors.append({"action": "create", "unique_key": session["unique_key"], "error": str(exc)})
+        return
+    created["item_id"] = item_id
+    report.created.append(created)
+    logger.info("CREATED item_id=%s unique_key=%s date=%s student=%s",
+                item_id, session["unique_key"], session.get("session_date"), session.get("student_name"))
+    if student_item_id:
+        _reconcile_connect(monday_client, report, item_id, student_item_id)
+
+
+def _reconcile_connect(monday_client, report, item_id, student_item_id):
+    try:
+        monday_client.connect_student(config.MONDAY_SESSIONS_BOARD_ID, item_id, config.COL_STUDENT_CONNECTION, student_item_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("CONNECTION_ERROR item_id=%s student_item_id=%s error=%s", item_id, student_item_id, exc)
+        report.connection_errors.append({"item_id": item_id, "error": str(exc)})
+        return False
+    report.connected.append({"item_id": item_id, "student_item_id": student_item_id})
+    return True
+
+
+def _reconcile_existing(monday_client, report, item, session, student_item_id, dry_run):
+    if _is_pre_baseline(item):
+        report.already_correct += 1   # baseline rows are never edited
+        return
+    cols = item["columns"]
+    new_values = _build_column_values(session)
+    changes, values = {}, {}
+    for key, column_id in _RECONCILED_FIELDS:
+        want = _text(session.get(key))
+        have = _text(cols.get(column_id))
+        if column_id == config.COL_SESSION_DATE:
+            have = have[:10]
+        if want and want != have:   # never blank a value Teachworks doesn't supply
+            changes[column_id] = (have, want)
+            values[column_id] = new_values[column_id]
+    if _is_flagged(item):
+        changes[config.COL_TEACHWORKS_SYNC_FLAG] = (cols.get(config.COL_TEACHWORKS_SYNC_FLAG), "")
+        values[config.COL_TEACHWORKS_SYNC_FLAG] = ""
+    needs_connection = bool(student_item_id) and not _text(cols.get(config.COL_STUDENT_CONNECTION))
+
+    if not changes and not needs_connection:
+        report.already_correct += 1
+        return
+    if changes:
+        if not dry_run:
+            try:
+                monday_client.update_item_columns(config.MONDAY_SESSIONS_BOARD_ID, item["item_id"], values)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("UPDATE_ERROR item_id=%s unique_key=%s error=%s", item["item_id"], session["unique_key"], exc)
+                report.errors.append({"action": "update", "item_id": item["item_id"], "error": str(exc)})
+                return
+        entry = {"item_id": item["item_id"], "unique_key": session["unique_key"], "changes": changes}
+        if config.COL_TEACHWORKS_SYNC_FLAG in changes:
+            report.unflagged.append(entry)
+        if set(changes) - {config.COL_TEACHWORKS_SYNC_FLAG}:
+            report.updated.append(entry)
+        for column_id, (old, new) in changes.items():
+            logger.info("UPDATED item_id=%s unique_key=%s column=%s %r -> %r",
+                        item["item_id"], session["unique_key"], column_id, old, new)
+    if needs_connection:
+        if dry_run:
+            report.connected.append({"item_id": item["item_id"], "student_item_id": student_item_id})
+        else:
+            _reconcile_connect(monday_client, report, item["item_id"], student_item_id)
+
+
+
+
+def perform_daily_sync(tw_client, monday_client, start_date, end_date, dry_run=False):
+    """The nightly pipeline, in order:
+
+    0. sync_students() - every Teachworks student gets a Students item (or an
+       exception for review). Runs first so the reconciliation can connect new
+       students' sessions. Its failure does not stop steps 1-2 (they don't need
+       it), but makes the run's result FAILURE.
+    1. reconcile_session_log() - the rolling Teachworks -> Session Log
+       reconciliation over [start_date, end_date].
+    2. IF AND ONLY IF step 1 succeeded (no exception, no failed create/update/
+       flag, no integrity failure) and this is not a dry run,
+       apply_post_baseline_student_rollup_updates() - the baseline+SET student
+       rollup, exactly as already built and tested.
+
+    Connection errors and missing students are reported but, as before, do
+    not block step 2.
+
+    Returns a dict: student_report (StudentSyncReport or None), student_exception,
+    sync_report (ReconcileReport or None), sync_exception, sync_succeeded,
+    rollup_ran, rollup_outcome, rollup_exception."""
+    student_report = None
+    student_exception = None
+    try:
+        student_report = sync_students(tw_client, monday_client, dry_run=dry_run)
+    except DryRunWriteBlocked:
+        raise
+    except Exception as exc:  # noqa: BLE001 - reported; the Session Log steps don't depend on it
+        student_exception = exc
+        logger.error("DAILY_SYNC_STUDENT_SYNC_ERROR error=%s", exc)
+
     sync_report = None
     sync_exception = None
     try:
-        sync_report = run_sync(
-            tw_client, monday_client, start_date, end_date,
-            dry_run=False, mode="SCHEDULED (rolling lookback)",
-        )
+        sync_report = reconcile_session_log(tw_client, monday_client, start_date, end_date, dry_run=dry_run)
     except Exception as exc:  # noqa: BLE001 - captured so the orchestration can report/exit non-zero instead of crashing
         sync_exception = exc
         logger.error("DAILY_SYNC_SESSION_LOG_ERROR error=%s", exc)
 
-    sync_succeeded = sync_exception is None and sync_report is not None and not sync_report.creation_errors
+    sync_succeeded = sync_exception is None and sync_report is not None and sync_report.succeeded
 
     rollup_ran = False
     rollup_outcome = None
     rollup_exception = None
-    if sync_succeeded:
+    if sync_succeeded and not dry_run:
         rollup_ran = True
         try:
             rollup_outcome = apply_post_baseline_student_rollup_updates(monday_client)
@@ -2254,6 +2658,8 @@ def perform_daily_sync(tw_client, monday_client, start_date, end_date):
             logger.error("DAILY_SYNC_ROLLUP_ERROR error=%s", exc)
 
     return {
+        "student_report": student_report,
+        "student_exception": student_exception,
         "sync_report": sync_report,
         "sync_exception": sync_exception,
         "sync_succeeded": sync_succeeded,
@@ -2263,34 +2669,92 @@ def perform_daily_sync(tw_client, monday_client, start_date, end_date):
     }
 
 
-def run_daily_sync(tw_client, monday_client, start_date, end_date):
-    """CLI-facing: runs perform_daily_sync() and prints a concise combined
-    summary (Session Log results, Student Rollup results, FINAL RESULT).
-    Only reachable via --daily-sync."""
+def print_reconcile_report(report):
+    def listing(title, entries, fmt):
+        if entries:
+            print(f"{title}:")
+            for e in entries:
+                print("  - " + fmt(e))
+
+    flag_mode = "flagged in the Sync Flag column" if config.COL_TEACHWORKS_SYNC_FLAG else "reported only (no Sync Flag column configured)"
+    would = report.dry_run
+    for label, value in [
+        ("Teachworks attended lessons fetched", report.teachworks_lessons),
+        ("Teachworks attended participant sessions", report.teachworks_sessions),
+        ("Monday Session Log rows read (whole board)", report.monday_rows_read),
+        ("Monday Session Log rows dated in the window", report.monday_rows_in_window),
+        ("Would create" if would else "Created", len(report.created)),
+        ("Would update" if would else "Updated", len(report.updated)),
+        ("Student connections to make" if would else "Student connections made", len(report.connected)),
+        ("Already correct", report.already_correct),
+        ("Not attended in Teachworks (stale)", f"{len(report.stale)} - {flag_mode}"),
+        ("Duplicates detected", len(report.duplicates)),
+        ("Ambiguous (not created)", len(report.ambiguous)),
+        ("Rows without a usable identity in window", len(report.unidentifiable_rows)),
+        ("Missing students (row created unconnected)", len(report.missing_students)),
+        ("Duplicate Teachworks IDs on Students board", len(report.duplicate_student_ids)),
+        ("Errors", len(report.errors)),
+        ("Connection errors", len(report.connection_errors)),
+        ("Integrity failures", len(report.integrity_failures)),
+        ("Attended sessions with a Session Log row", f"{report.attended_rows} of {report.teachworks_sessions}"),
+    ]:
+        print(f"{label + ':':<46}{value}")
+    listing("CREATED" if not report.dry_run else "WOULD CREATE", report.created,
+            lambda c: f"{c['session_date']} {c['unique_key']} {c['student_name']} (tutor: {c['tutor']}, type: {c['service']})")
+    listing("UPDATED" if not report.dry_run else "WOULD UPDATE", report.updated,
+            lambda u: f"item {u['item_id']} {u['unique_key']}: " + "; ".join(
+                f"{col} {old!r} -> {new!r}" for col, (old, new) in u["changes"].items()))
+    listing("NOT ATTENDED IN TEACHWORKS (left in place)", report.stale,
+            lambda r: f"{r['session_date']} item {r['item_id']} {r['unique_key']} {r['student_name']}"
+                      + (" [already flagged]" if r["flagged"] else ""))
+    listing("FLAGGED", report.flagged, lambda r: f"item {r['item_id']} {r['unique_key']}")
+    listing("UNFLAGGED (attended again)", report.unflagged, lambda u: f"item {u['item_id']} {u['unique_key']}")
+    listing("DUPLICATES (left in place)", report.duplicates,
+            lambda d: f"{d['identity'][0]}_{d['identity'][1]}: items {', '.join(map(str, d['item_ids']))}")
+    listing("AMBIGUOUS (not created)", report.ambiguous, lambda a: f"{a['session_date']} {a['identity'][0]}_{a['identity'][1]}")
+    listing("ROWS WITHOUT A USABLE IDENTITY", report.unidentifiable_rows,
+            lambda r: f"{r['session_date']} item {r['item_id']} key={r['unique_key']!r} {r['student_name']}")
+    listing("DUPLICATE TEACHWORKS STUDENT IDS (sessions NOT connected - review)", report.duplicate_student_ids,
+            lambda d: f"Teachworks ID {d['teachworks_id']}: Students items {', '.join(map(str, d['item_ids']))}; "
+                      f"{len(d['sessions'])} session(s) left unconnected ({', '.join(d['sessions'])})")
+    listing("ERRORS", report.errors, lambda e: f"{e['action']} {e.get('unique_key') or e.get('item_id')}: {e['error']}")
+    listing("CONNECTION ERRORS", report.connection_errors, lambda e: f"item {e['item_id']}: {e['error']}")
+    listing("INTEGRITY FAILURES (nothing flagged)", report.integrity_failures, str)
+
+
+def run_daily_sync(tw_client, monday_client, start_date, end_date, dry_run=False):
+    """CLI-facing: runs perform_daily_sync() and prints a combined summary
+    (Session Log reconciliation, Student Rollup, FINAL RESULT). Only
+    reachable via --daily-sync."""
     print("=" * 70)
-    print("DAILY SYNC (Session Log sync -> post-baseline student rollup)")
-    print(f"Date range: {start_date} .. {end_date}")
+    print(f"DAILY SYNC{' - DRY RUN (no writes)' if dry_run else ''} (Session Log reconciliation -> post-baseline rollup)")
+    print(f"Reconciliation window: {start_date} .. {end_date}")
     print("=" * 70)
 
-    outcome = perform_daily_sync(tw_client, monday_client, start_date, end_date)
+    outcome = perform_daily_sync(tw_client, monday_client, start_date, end_date, dry_run=dry_run)
+    student_ok = outcome.get("student_exception") is None and (
+        outcome.get("student_report") is None or outcome["student_report"].succeeded)
 
-    print("\n--- STEP 1: SESSION LOG SYNC ---")
+    print("\n--- STEP 0: STUDENTS BOARD ROSTER ---")
+    if outcome.get("student_exception") is not None:
+        print(f"EXCEPTION: {outcome['student_exception']}")
+        print("No students were created after the failure point.")
+    elif outcome.get("student_report") is not None:
+        print_student_report(outcome["student_report"])
+
+    print("\n--- STEP 1: SESSION LOG RECONCILIATION ---")
     if outcome["sync_exception"] is not None:
         print(f"EXCEPTION: {outcome['sync_exception']}")
+        print("Nothing was written after the failure point; no rows were flagged.")
     else:
-        report = outcome["sync_report"]
-        print(f"Lessons fetched:                {report.lessons_fetched}")
-        print(f"Attended sessions found:        {report.attended_sessions_found}")
-        print(f"Sessions created:               {report.sessions_created}")
-        print(f"Sessions skipped as duplicates: {report.sessions_skipped}")
-        print(f"Creation errors:                {len(report.creation_errors)}")
-        print(f"Missing students:               {len(report.missing_students)}")
-        print(f"Connection errors:              {len(report.connection_errors)}")
-    print(f"Session Log sync succeeded (gate for Step 2): {outcome['sync_succeeded']}")
+        print_reconcile_report(outcome["sync_report"])
+    print(f"Session Log reconciliation succeeded (gate for Step 2): {outcome['sync_succeeded']}")
 
     print("\n--- STEP 2: POST-BASELINE STUDENT ROLLUP ---")
-    if not outcome["rollup_ran"]:
-        print("SKIPPED - Session Log sync did not succeed (see Step 1 above).")
+    if dry_run:
+        print("SKIPPED - dry run.")
+    elif not outcome["rollup_ran"]:
+        print("SKIPPED - Session Log reconciliation did not succeed (see Step 1 above).")
     elif outcome["rollup_exception"] is not None:
         print(f"EXCEPTION: {outcome['rollup_exception']}")
     else:
@@ -2301,7 +2765,7 @@ def run_daily_sync(tw_client, monday_client, start_date, end_date):
         print(f"Skipped (cannot be matched):  {len(rollup['skipped_unmatched'])}")
         print(f"Failed writes:                {len(rollup['failed'])}")
 
-    if not outcome["sync_succeeded"]:
+    if not outcome["sync_succeeded"] or not student_ok:
         final_result = "FAILURE"
     elif outcome["rollup_exception"] is not None:
         final_result = "FAILURE"
@@ -2311,7 +2775,7 @@ def run_daily_sync(tw_client, monday_client, start_date, end_date):
         final_result = "SUCCESS"
 
     print("\n" + "=" * 70)
-    print(f"FINAL RESULT: {final_result}")
+    print(f"FINAL RESULT: {final_result}{' (dry run)' if dry_run else ''}")
     print("=" * 70)
 
     return 0 if final_result == "SUCCESS" else 1
@@ -2383,7 +2847,34 @@ def _date_range(args):
     return start, end
 
 
+_READ_ONLY_COMMANDS = (
+    "dump_sample", "diagnose_teachworks", "diagnose_dedup", "diagnose_student_columns",
+    "diagnose_student_rollups", "diagnose_student_rollup_delta", "diagnose_checkpoint_migration",
+    "diagnose_baseline_migration_columns", "diagnose_baseline_migration", "diagnose_session_log_duplicates",
+    "diagnose_baseline_migration_cutover",
+)
+
+
+def _run_mode_banner(args):
+    """What this command can do to Monday, for the first line of the log."""
+    if args.dry_run:
+        return "DRY RUN - Monday writes are blocked"
+    if any(getattr(args, name) for name in _READ_ONLY_COMMANDS):
+        return "READ ONLY - this command makes no Monday writes"
+    if (args.post_baseline_rollups or args.student_rollups) and not args.apply:
+        return "READ ONLY - this command makes no Monday writes"
+    return "LIVE - Monday writes enabled"
+
+
 def main(argv=None):
+    try:
+        return _main(argv)
+    except DryRunWriteBlocked as exc:
+        print(f"ABORTED: {exc}. Nothing was written to Monday.")
+        return 3
+
+
+def _main(argv=None):
     parser = argparse.ArgumentParser(description="Sync Teachworks attended sessions into Monday.com.")
     parser.add_argument("--dry-run", action="store_true", help="Fetch and report only; create/update nothing.")
     parser.add_argument("--full", action="store_true", help="Full historical reconciliation instead of the rolling lookback window.")
@@ -2404,7 +2895,7 @@ def main(argv=None):
     parser.add_argument("--post-baseline-rollups", action="store_true", help="Calculate the baseline+SET student rollup (Session Count = Historical Session Baseline + distinct post-baseline Session Log identities). Combine with --dry-run to preview, or --apply to perform the real Monday writes.")
     parser.add_argument("--student-rollups", action="store_true", help="Calculate production-ready Student rollup updates (baseline+delta, per-student checkpoint). Combine with --dry-run to preview, or --apply to perform the real Monday writes.")
     parser.add_argument("--apply", action="store_true", help="Perform REAL Monday writes for --student-rollups. Writes never happen just because --dry-run is absent - --apply must be passed explicitly.")
-    parser.add_argument("--daily-sync", action="store_true", help="Orchestrates the nightly pipeline: runs the Session Log sync (rolling lookback), then IF AND ONLY IF it succeeds (no exception, no creation_errors), applies the post-baseline student rollup. Reuses run_sync() and apply_post_baseline_student_rollup_updates() exactly as-is - no duplicated business logic.")
+    parser.add_argument("--daily-sync", action="store_true", help="The nightly pipeline: reconciles the Session Log against Teachworks for the last RECONCILE_DAYS days (never before RECONCILE_FLOOR_DATE) - creates missing attended sessions, corrects drifted fields, reports rows no longer attended - then, only if that fully succeeded, applies the post-baseline student rollup. With --dry-run: reads only, writes nothing, no rollup.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (default INFO).")
     args = parser.parse_args(argv)
 
@@ -2414,8 +2905,15 @@ def main(argv=None):
     )
 
     config.validate()
+    print(f"{SYNC_VERSION} | {_run_mode_banner(args)}")
 
     start_date, end_date = _date_range(args)
+    if args.daily_sync:
+        if not args.full and args.lookback_days is None:
+            start_date, end_date = reconcile_window(datetime.date.today(), config.RECONCILE_DAYS, config.RECONCILE_FLOOR_DATE)
+        # Never reconcile before the floor, whatever the flags: earlier dates are
+        # pre-baseline and creating them unflagged would inflate student totals.
+        start_date = max(start_date, config.RECONCILE_FLOOR_DATE)
 
     tw_client = TeachworksClient(
         api_key=config.TEACHWORKS_API_KEY,
@@ -2423,6 +2921,7 @@ def main(argv=None):
         timeout=config.REQUEST_TIMEOUT_SECONDS,
         max_retries=config.MAX_RETRIES,
         retry_base_delay=config.RETRY_BASE_DELAY_SECONDS,
+        request_delay_seconds=config.TEACHWORKS_REQUEST_DELAY_SECONDS,
     )
 
     # Monday.com is intentionally not constructed above: --dump-sample and
@@ -2446,6 +2945,8 @@ def main(argv=None):
         max_retries=config.MAX_RETRIES,
         retry_base_delay=config.RETRY_BASE_DELAY_SECONDS,
     )
+    if args.dry_run:
+        make_read_only(monday_client)
 
     if args.diagnose_student_columns:
         return diagnose_student_columns(monday_client)
@@ -2503,7 +3004,7 @@ def main(argv=None):
         return diagnose_dedup(tw_client, monday_client, start_date, end_date)
 
     if args.daily_sync:
-        return run_daily_sync(tw_client, monday_client, start_date, end_date)
+        return run_daily_sync(tw_client, monday_client, start_date, end_date, dry_run=args.dry_run)
 
     mode = "FULL RECONCILIATION" if args.full else "SCHEDULED (rolling lookback)"
     if args.dry_run:
